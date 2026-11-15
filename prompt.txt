@@ -1,4 +1,4 @@
-Build a real-time fantasy underwater scene that runs in the browser. It only needs to look beautiful and let me fly a free camera through it.
+Build a real-time subtropical mountain forest scene that runs in the browser, modeled on the forests of Taiwan. It only needs to look beautiful and let me walk through it in first person, with the forest changing as I gain or lose altitude.
 
 PRIORITIES (in this order when they conflict)
 1. Visual quality
@@ -13,23 +13,35 @@ CONSTRAINTS
 
 TARGET
 - Windows 11 25H2, Chrome 157, RTX 5070 Ti, Ryzen 7800X3D, 180 Hz monitor
-- 2560×1440 at full resolution. GPU frame time ≤ 11 ms average, no frame > 16.7 ms during a scripted 60 s fly-through.
+- 2560×1440 at full resolution. GPU frame time ≤ 11 ms average, no frame > 16.7 ms during a scripted 60 s walk-through.
 
-SCENE
-- Dense, towering kelp columns with sparkling green/gold specks, swaying
-- Strong depth fog/absorption: cyan near the surface → deep blue in the distance
-- God rays, animated caustics, wavy surface visible from below
-- Rock canyons, arches and overhangs; floating boulders
-- Iridescent purple/pink foliage, magenta ground cover, barrel sponges, coral
-- Animated life: manta rays, fish schools, rising bubbles, drifting particles
-- Set pieces: a sunken ship hull, a stone whale-fluke sculpture
-- World: bounded, but the boundaries can't be visible from the starting area
+WORLD
+- The island is shaped like Taiwan: the coastline is the world boundary, with open ocean to the horizon beyond it. The player cannot walk into the sea.
+- Terrain follows Taiwan's real relief in broad strokes: a high central spine running NNE–SSW with peaks near 3,950 m, a steep eastern flank, gentler western foothills and plains, a narrow coastal range in the east. Encode this compactly (e.g. a low-res coastline polyline plus a few ridge splines, with procedural noise for detail), not as an image file.
+- Horizontal scale is compressed so that walking is rewarding: sprinting uphill from the coast to the highest summit should take roughly 8–10 minutes, with a noticeable change of forest every 1–2 minutes. Altitude values stay real (0–3,950 m).
+- No cities, farms, roads or real-world land use. The whole island is wild forest; vegetation depends only on altitude, with slight variation from slope, aspect and moisture.
+- Spawn: a random land position on each load (seedable via URL parameter for reproducibility).
+
+FOREST ZONES (by altitude, blended gradually with no hard bands)
+- 0–500 m, lowland subtropical broadleaf: banyans with aerial roots and buttresses, giant taro, lianas, bamboo groves, dense humid understory
+- 500–1,500 m, laurel–oak evergreen broadleaf: closed canopy, tree ferns, bird's-nest ferns and other epiphytes on trunks, deep leaf litter
+- 1,500–2,500 m, cloud forest: giant red cypress and hinoki with massive trunks, moss on everything, drifting fog, mixed broadleaf–conifer
+- 2,500–3,100 m, hemlock and spruce: tall dark conifers, open floor carpeted with Yushan cane (dwarf bamboo)
+- 3,100–3,600 m, fir forest: dense straight-trunked Taiwan fir, bleached dead snags, cane meadows in clearings
+- Above 3,600 m, alpine: twisted wind-shaped juniper krummholz, rhododendron scrub, cane grassland, bare rock and scree
+
+ATMOSPHERE AND DETAIL
+- Light shafts through the canopy, dappled moving light on the forest floor, wind sway in leaves, ferns and bamboo
+- Altitude-dependent air: warm humid haze in the lowlands, thick fog in the cloud belt, crisp clear light above it with a sea of clouds visible below from high ridges
+- Streams, waterfalls and mossy boulders in the valleys; exposed rock ridges and cliffs higher up
+- Animated life: butterflies and fireflies low down, bird flocks, macaques in the broadleaf canopy, pheasants on the forest floor, deer in high meadows, falling leaves, drifting mist and pollen
+- Set pieces: one ancient giant cypress ("sacred tree"), a suspension footbridge over a gorge, a stretch of abandoned logging railway, a summit marker on the highest peak
 
 CONTROLS
-WASD move, mouse look (pointer lock), Q/E up/down, Shift to accelerate
+WASD walk, mouse look (pointer lock), Shift to sprint, Space to jump. Camera stays at eye height (~1.7 m) and follows the terrain; no flying. Show a small unobtrusive altitude readout with the current forest zone name.
 
 VERIFICATION
-- Visual critic: a separate subagent that sees ONLY the your renders, never your code or reasoning. Give it 6 fixed camera poses, rendered at 2560×1440 in GPU-accelerated Chrome, plus a short recording of the fly-through to catch shimmer, aliasing, popping and banding. It returns prioritized, concrete defects. Iterate until it reports nothing above "minor".
-- Performance: GPU timestamp queries plus a frame-time log from the scripted fly-through. Report average, 99th percentile and max.
+- Visual critic: a separate subagent that sees ONLY your renders, never your code or reasoning. Give it 6 fixed camera poses, one inside each forest zone, rendered at 2560×1440 in GPU-accelerated Chrome, plus a short recording of the walk-through to catch shimmer, aliasing, popping and banding. It must also confirm that the six zones are clearly distinguishable from each other and that the transitions between them look natural. It returns prioritized, concrete defects. Iterate until it reports nothing above "minor".
+- Performance: GPU timestamp queries plus a frame-time log from a scripted 60 s walk-through with a fixed seed, on a path that climbs through at least three zones (movement speed may be raised for the script). Report average, 99th percentile and max.
 
 DONE WHEN: both verification gates pass. Deliver index.html, the bundle size, the perf report and the critic's final review.

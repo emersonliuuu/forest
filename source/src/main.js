@@ -1,643 +1,390 @@
-// ============================================================================
-// renderer, camera and input
-// ============================================================================
-const $ = (id) => document.getElementById(id);
-const canvas = $('c'), info = $('i'), body = document.body;
-// a phone held upright gets the page turned on its side (see template.html)
-const rot = matchMedia('(orientation:portrait) and (pointer:coarse)');
-// loading bar: each stage glides it to `to` (the share done) over ~`ms` on the compositor, so it moves while this
-// thread is busy
-let loaded = 0, dead; // dead: the graphics device was lost
-const say = (m, to, ms) => {
-  if (!dead) $('s').textContent = m;
-  const a = $('b').animate({ transform: [`scaleX(${loaded})`, `scaleX(${to})`] }, { duration: ms, fill: 'forwards', easing: 'cubic-bezier(.3,.5,.5,1)' });
-  loaded = to;
-  // go on once the animation runs: one not started before the thread gets busy stays stuck (timer: hidden tabs)
-  return new Promise((r) => { a.ready.then(() => setTimeout(r)); setTimeout(r, document.hidden ? 0 : 1e3); });
-};
-const fail = (m) => { throw new Error(m, { cause: 1 }); }; // cause marks a message that is shown as it is
-if (!navigator.gpu) fail('This scene needs WebGPU. Try a current Chrome or Edge.');
-const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
-if (!adapter) fail('No WebGPU adapter found.');
-$('w').hidden = !!navigator.userAgentData; // only Chromium-based browsers have it
-const hasTS = adapter.features.has('timestamp-query');
-const device = await adapter.requestDevice({ requiredFeatures: hasTS ? ['timestamp-query'] : [] });
-device.addEventListener('uncapturederror', (e) => console.error('GPU: ' + e.error.message));
-// out of memory or a GPU timeout: reload a level lower, or on Low say what happened
-device.lost.then((l) => {
-  if (l.reason === 'destroyed') return; // the page is closing
-  if (LV < 2) { keep('abyssal', LV + 1); location.reload(); }
-  dead = body.className = 'l e'; $('s').textContent = 'The graphics device was lost. Reload the page to try again.';
-});
-const ctx = canvas.getContext('webgpu'), FMT = navigator.gpu.getPreferredCanvasFormat();
-const Q = device.queue, HDR = 'rgba16float', DEPTH = 'depth32float';
-const TU = GPUTextureUsage, BU = GPUBufferUsage, SS = GPUShaderStage;
+import { genWorld, H, W, site, macro, MW, MH, mkrng, sst, sat, zalt, deckY, ZONES, zoneOf, nd } from './world.js';
+import { genAtlas, genNoise, genNoise3 } from './atlas.js';
+import { genMeshes, NK, NP } from './mesh.js';
+import { renderWGSL, postWGSL, blitWGSL, computeWGSL, NEAR, LR, TG, UG, GG, NPOL, NFLY } from './shaders.js';
 
-const mod = (code) => device.createShaderModule({ code });
-const buf = (data, usage) => { const b = device.createBuffer({ size: (data.byteLength + 3) & ~3, usage: usage | BU.COPY_DST }); Q.writeBuffer(b, 0, data.buffer || data, data.byteOffset || 0, data.byteLength); return b; };
-const tex = (w, h, format, usage, o = {}) => device.createTexture({ size: [w, h, o.d || 1], format, usage, mipLevelCount: o.mips || 1, sampleCount: o.samples || 1, dimension: o.d ? '3d' : '2d' });
+const Q = new URLSearchParams(location.search), $ = id => document.getElementById(id);
+const canvas = $('c'), msg = $('m');
+const fail = t => { msg.textContent = t; msg.style.display = 'block'; };
 
-// ---------------------------------------------------------------- static resources
-const sRep = device.createSampler({ addressModeU: 'repeat', addressModeV: 'repeat', magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', maxAnisotropy: LV > 1 ? 1 : 8 });
-const sClamp = device.createSampler({ magFilter: 'linear', minFilter: 'linear' });
-const sCmp = device.createSampler({ compare: 'less-equal', magFilter: 'linear', minFilter: 'linear' });
-const tShadow = tex(SHADOW, SHADOW, DEPTH, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING);
-const tDummy = tex(1, 1, DEPTH, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING);
-const tWater = tex(WATER, WATER, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING, { mips: 5 });
-const tDetail = tex(1024, 1024, 'rgba8unorm', TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING, { mips: 11 });
-const tVol = tex(NX / 2, NY / 2, 'rg8unorm', TU.TEXTURE_BINDING | TU.COPY_DST, { d: NZ / 2 });
-const tMap = tex(512, 512, 'rgba8unorm', TU.TEXTURE_BINDING | TU.COPY_DST);
+async function main() {
+  const adapter = await navigator.gpu?.requestAdapter({ powerPreference: 'high-performance' });
+  if (!adapter) return fail('This scene needs WebGPU (Chrome / Edge 113+ on desktop).');
+  const hasTS = adapter.features.has('timestamp-query') && new URLSearchParams(location.search).has('bench'); // GPU timing only in bench mode
+  const dev = await adapter.requestDevice({ requiredFeatures: hasTS ? ['timestamp-query'] : [] });
+  dev.addEventListener('uncapturederror', e => console.error(e.error.message.slice(0, 400)));
+  const ctx = canvas.getContext('webgpu'), fmt = navigator.gpu.getPreferredCanvasFormat();
+  dev.lost.then(i => console.error('device lost', i.message));
+  const DBG = +(Q.get('dbg') || 0), BENCH = Q.has('bench'), MANUAL = Q.has('manual'), MSAA = +(Q.get('msaa') || 4);
+  if (!MANUAL) ctx.configure({ device: dev, format: fmt, alphaMode: 'opaque' });
+  let offT = null; // headless capture target (manual mode renders offscreen and reads pixels back)
 
-const UB = new Float32Array(60), UBS = new Float32Array(60);
-const ubo = device.createBuffer({ size: 240, usage: BU.UNIFORM | BU.COPY_DST }), uboS = device.createBuffer({ size: 240, usage: BU.UNIFORM | BU.COPY_DST });
-const WT = new Float32Array(4), uboW = device.createBuffer({ size: 16, usage: BU.UNIFORM | BU.COPY_DST });
+  // ---------- world + CPU-generated assets ----------
+  genWorld();
+  const tex = (d, data, bpr, rows) => { const t = dev.createTexture(d); if (data) data.forEach((m, i) => dev.queue.writeTexture({ texture: t, mipLevel: i }, m, { bytesPerRow: bpr >> i, rowsPerImage: rows ? rows >> i : undefined }, [Math.max(1, d.size[0] >> i), Math.max(1, d.size[1] >> i), d.size[2] || 1])); return t; };
+  const TB = GPUTextureUsage.TEXTURE_BINDING, RA = GPUTextureUsage.RENDER_ATTACHMENT, CD = GPUTextureUsage.COPY_DST;
+  const macroT = tex({ size: [MW, MH], format: 'r32float', usage: TB | CD }, [macro], MW * 4);
+  const noiseT = tex({ size: [256, 256], format: 'rgba8unorm', mipLevelCount: 9, usage: TB | CD }, genNoise(), 1024);
+  const atlasT = tex({ size: [1024, 1024], format: 'rgba8unorm-srgb', mipLevelCount: 6, usage: TB | CD }, genAtlas().slice(0, 6), 4096);
+  const noise3 = tex({ size: [64, 64, 64], dimension: '3d', format: 'r8unorm', usage: TB | CD }, [genNoise3()], 64, 64);
+  const shadowT = dev.createTexture({ size: [2048, 2048, 2], format: 'depth32float', usage: TB | RA });
+  const IW = 2048, IH = 1536, IM = 6;
+  const impC = dev.createTexture({ size: [IW, IH], format: 'rgba8unorm-srgb', mipLevelCount: IM, usage: TB | RA });
+  const impN = dev.createTexture({ size: [IW, IH], format: 'rgba8unorm', mipLevelCount: IM, usage: TB | RA });
+  const samp = dev.createSampler({ magFilter: 'linear', minFilter: 'linear', mipmapFilter: 'linear', addressModeU: 'repeat', addressModeV: 'repeat', addressModeW: 'repeat', maxAnisotropy: 8 });
+  const sampC = dev.createSampler({ compare: 'less', magFilter: 'linear', minFilter: 'linear' });
 
-const VF = SS.VERTEX | SS.FRAGMENT;
-const bgl0 = device.createBindGroupLayout({ entries: [
-  { binding: 0, visibility: VF, buffer: {} },
-  { binding: 1, visibility: VF, sampler: {} }, { binding: 2, visibility: VF, sampler: {} }, { binding: 3, visibility: VF, sampler: { type: 'comparison' } },
-  { binding: 4, visibility: VF, texture: { sampleType: 'depth' } },
-  { binding: 5, visibility: VF, texture: {} }, { binding: 6, visibility: VF, texture: {} },
-  { binding: 7, visibility: VF, texture: { viewDimension: '3d' } }, { binding: 8, visibility: VF, texture: {} }] });
-const mkBG0 = (u, sh) => device.createBindGroup({ layout: bgl0, entries: [
-  { binding: 0, resource: { buffer: u } }, { binding: 1, resource: sRep }, { binding: 2, resource: sClamp }, { binding: 3, resource: sCmp },
-  { binding: 4, resource: sh.createView() }, { binding: 5, resource: tWater.createView() }, { binding: 6, resource: tDetail.createView() },
-  { binding: 7, resource: tVol.createView() }, { binding: 8, resource: tMap.createView() }] });
-const bg0 = mkBG0(ubo, tShadow), bg0s = mkBG0(uboS, tDummy);
-const pl0 = device.createPipelineLayout({ bindGroupLayouts: [bgl0] });
+  // ---------- meshes + instance lists ----------
+  const ms = genMeshes(), BU = GPUBufferUsage;
+  const mkbuf = (data, usage) => { const b = dev.createBuffer({ size: data.byteLength + 3 & ~3, usage: usage | BU.COPY_DST }); dev.queue.writeBuffer(b, 0, data); return b; };
+  const meshVB = mkbuf(ms.vb, BU.VERTEX), meshIB = mkbuf(ms.ib, BU.INDEX);
+  // list capacities per kind: [main, cascade0, cascade1]
+  const CAP = k => k < 12 ? [384, 192, 768] : k < 17 ? [3072, 768, 2048] : k == 17 ? [24576, 1, 1] : k == 18 ? [16384, 1, 1] : k == 19 || k == 20 || k == 24 ? [320, 1, 1] : [64, 32, 64];
+  const CAST = k => k < 17 || (k > 20 && k < 24);
+  const NL = NK * 3 + 1, LB = [], LC = []; let tot = 0;
+  for (let k = 0; k < NK; k++) for (const c of CAP(k)) { LB.push(tot); LC.push(c); tot += c; }
+  LB.push(tot); LC.push(65536); tot += 65536;
+  const instB = dev.createBuffer({ size: tot * 32, usage: BU.STORAGE | BU.VERTEX | BU.COPY_SRC });
+  const drawT = new Uint32Array(NL * 5);
+  for (let k = 0; k < NK; k++) for (let j = 0; j < 3; j++) { const o = (k * 3 + j) * 5; drawT[o] = ms.info[k].count; drawT[o + 2] = ms.info[k].first; drawT[o + 3] = ms.info[k].base; }
+  if (Q.has('swap')) for (let j = 0; j < 3; j++) { const o = (16 * 3 + j) * 5, m = ms.info[+Q.get('swap')]; drawT[o] = m.count; drawT[o + 2] = m.first; drawT[o + 3] = m.base; }
+  if (Q.has('swap2')) for (let j = 0; j < 3; j++) { const o = (+Q.get('swap2') * 3 + j) * 5, m = ms.info[16]; drawT[o] = m.count; drawT[o + 2] = m.first; drawT[o + 3] = m.base; }
+  drawT[NK * 15] = 4;
+  const drawB = dev.createBuffer({ size: drawT.byteLength, usage: BU.STORAGE | BU.INDIRECT | BU.COPY_DST | BU.COPY_SRC });
+  // tree zone table: lo, hi, fade, weight
+  const KT = [[0, 520, 160, .22], [0, 850, 260, 1], [0, 720, 200, .22], [450, 2350, 300, 1], [350, 1800, 250, .75], [1550, 2600, 200, .8], [1650, 2600, 200, .7], [2450, 3150, 180, 1], [2500, 3150, 180, .6], [3050, 3660, 150, 1.3], [3050, 3700, 150, .14], [3520, 4100, 120, 1]];
+  const KS = ms.info.slice(0, NK).map((m, k) => k < 12 ? [.8, .45, m.ht, 0] : k == 14 ? [.45, .4, 3, 0] : k < 17 ? [.6, .55, Math.max(m.ht, m.hw), 0] : [1, 0, 1, 0]);
+  const propI = new Float32Array(NP * 8), propB = dev.createBuffer({ size: propI.byteLength, usage: BU.VERTEX | BU.COPY_DST });
+  const propA = [[site[4], site[6], site[5]], [site[16], site[20], site[17]], [site[8], site[11], site[9]], [site[0], site[2], site[1]]];
+  for (let k = 0; k < NP; k++) { propI[k * 8 + 3] = 1; propI[k * 8 + 6] = 1; }
+  const bakeB = mkbuf(new Float32Array(12 * 8), BU.VERTEX);
 
-const bglBlit = device.createBindGroupLayout({ entries: [{ binding: 0, visibility: SS.FRAGMENT, texture: {} }, { binding: 1, visibility: SS.FRAGMENT, sampler: {} }] });
-const plBlit = device.createPipelineLayout({ bindGroupLayouts: [bglBlit] });
-const mBlit = mod(W_BLIT);
-const blitPipe = (entry, format, add) => device.createRenderPipeline({ layout: plBlit, vertex: { module: mBlit, entryPoint: 'vs' },
-  fragment: { module: mBlit, entryPoint: entry, targets: [{ format, blend: add ? { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'one', dstFactor: 'one' } } : undefined }] } });
-const pMip8 = blitPipe('fsMip', 'rgba8unorm'), pMip16 = blitPipe('fsMip', HDR), pDown0 = blitPipe('fsDown0', HDR), pDown = blitPipe('fsDown', HDR), pUp = blitPipe('fsUp', HDR, true);
-const blitBG = (view) => device.createBindGroup({ layout: bglBlit, entries: [{ binding: 0, resource: view }, { binding: 1, resource: sClamp }] });
-const colorAtt = (view, clear) => ({ view, loadOp: clear ? 'clear' : 'load', storeOp: 'store', clearValue: [0, 0, 0, 0] });
-
-// vertex layouts
-const A = (shaderLocation, offset, format) => ({ shaderLocation, offset, format });
-const vbSolid = { arrayStride: 16, attributes: [A(0, 0, 'float32x3'), A(1, 12, 'snorm8x4')] };
-const ibSolid = { arrayStride: 48, stepMode: 'instance', attributes: [A(2, 0, 'float32x4'), A(3, 16, 'float32x4'), A(4, 32, 'float32x4')] };
-const ibLeaf = { arrayStride: 36, stepMode: 'instance', attributes: [A(0, 0, 'float32x4'), A(1, 16, 'float32x4'), A(2, 32, 'unorm8x4')] };
-const ibAnim = { arrayStride: 32, stepMode: 'instance', attributes: [A(2, 0, 'float32x4'), A(3, 16, 'float32x4')] };
-const ibBub = { arrayStride: 32, stepMode: 'instance', attributes: [A(0, 0, 'float32x4'), A(1, 16, 'float32x4')] };
-const ibSnow = { arrayStride: 16, stepMode: 'instance', attributes: [A(0, 0, 'float32x4')] };
-
-const scenePipe = (m, vsE, fsE, buffers, o = {}) => device.createRenderPipeline({ layout: pl0,
-  vertex: { module: m, entryPoint: vsE, buffers, constants: o.constants },
-  fragment: { module: m, entryPoint: fsE, targets: [{ format: HDR, blend: o.blend }] },
-  primitive: { topology: o.strip ? 'triangle-strip' : 'triangle-list', cullMode: o.cull || 'none' },
-  depthStencil: { format: DEPTH, depthWriteEnabled: !o.blend, depthCompare: 'greater' }, multisample: { count: AA } });
-const shadowPipe = (m, vsE, buffers, o = {}) => device.createRenderPipeline({ layout: pl0,
-  vertex: { module: m, entryPoint: vsE, buffers, constants: o.constants },
-  primitive: { topology: o.strip ? 'triangle-strip' : 'triangle-list', cullMode: o.cull || 'none' },
-  depthStencil: { format: DEPTH, depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 1.5 } });
-
-await say('Compiling shaders…', 0.05, 300);
-const mSolid = mod(W_SOLID), mLeaf = mod(W_LEAF), mAnim = mod(W_ANIM), mSurf = mod(W_SURF), mSpr = mod(W_SPR);
-const pTerrain = scenePipe(mSolid, 'vs', 'fs', [vbSolid, ibSolid], { cull: 'back' });
-const pSolid = scenePipe(mSolid, 'vs', 'fs', [vbSolid, ibSolid]);
-const pLeaf = scenePipe(mLeaf, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 9 } });
-const pLeaf5 = scenePipe(mLeaf, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 5 } });
-const pLeafS = scenePipe(mLeaf, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 3, FAR: 70 } });
-const pLeafF = scenePipe(mLeaf, 'vs', 'fs', [ibLeaf], { strip: true, constants: { ROWS: 3 } });
-const pFish = scenePipe(mAnim, 'vsFish', 'fsFish', [vbSolid, ibAnim]);
-const pManta = scenePipe(mAnim, 'vsManta', 'fsManta', [vbSolid, ibAnim]);
-const pSurf = scenePipe(mSurf, 'vs', 'fs', [], { strip: true }), pBack = scenePipe(mSurf, 'vsB', 'fsB', [], { strip: true });
-const pBub = scenePipe(mSpr, 'vsBub', 'fsBub', [ibBub], { strip: true, blend: { color: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' }, alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha' } } });
-const ADD = { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'one', dstFactor: 'one' } };
-const pSnow = scenePipe(mSpr, 'vsSnow', 'fsSnow', [ibSnow], { strip: true, blend: ADD });
-const pGl = scenePipe(mLeaf, 'vsGl', 'fsGl', [ibBub], { strip: true, blend: ADD, constants: { ROWS: 7 } });
-const pSolidSh = shadowPipe(mSolid, 'vs', [vbSolid, ibSolid]), pTerrSh = shadowPipe(mSolid, 'vs', [vbSolid, ibSolid], { cull: 'front' });
-const pLeafSh = shadowPipe(mLeaf, 'vs', [ibLeaf], { strip: true, constants: { ROWS: 3 } });
-
-const mWater = mod(W_WATER);
-const pWater = device.createRenderPipeline({ layout: 'auto', vertex: { module: mWater, entryPoint: 'vs' }, fragment: { module: mWater, entryPoint: 'fs', targets: [{ format: HDR }] } });
-const bgWater = device.createBindGroup({ layout: pWater.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: uboW } }] });
-const waterViews = [0, 1, 2, 3, 4].map((m) => tWater.createView({ baseMipLevel: m, mipLevelCount: 1 }));
-const waterBG = waterViews.map((v) => blitBG(v));
-const waterPass = waterViews.map((v) => ({ colorAttachments: [colorAtt(v, true)] }));
-
-const mRays = mod(W_RAYS), mPost = mod(W_POST), mRB = mod(W_RBLUR);
-const pRB = device.createRenderPipeline({ layout: 'auto', vertex: { module: mRB, entryPoint: 'vs' }, fragment: { module: mRB, entryPoint: 'fs', targets: [{ format: HDR }] } });
-const pRays = device.createRenderPipeline({ layout: 'auto', vertex: { module: mRays, entryPoint: 'vs' }, fragment: { module: mRays, entryPoint: 'fs', targets: [{ format: HDR }] } });
-const pPost = device.createRenderPipeline({ layout: 'auto', vertex: { module: mPost, entryPoint: 'vs' }, fragment: { module: mPost, entryPoint: 'fs', targets: [{ format: FMT }] } });
-
-// ---------------------------------------------------------------- sun + shadow matrix
-const SUN = (() => { const v = [0.27, 1, -0.24], l = hypot(...v); return v.map((c) => c / l); })();
-{
-  const L = SUN, lr = [L[1], -L[0], 0], ll = hypot(...lr); lr[0] /= ll; lr[1] /= ll;
-  const lu = [L[1] * lr[2] - L[2] * lr[1], L[2] * lr[0] - L[0] * lr[2], L[0] * lr[1] - L[1] * lr[0]];
-  const R = 225, d0 = -175, d1 = 125, m = UBS;
-  m[0] = lr[0] / R; m[4] = lr[1] / R; m[8] = lr[2] / R; m[12] = 0;
-  m[1] = lu[0] / R; m[5] = lu[1] / R; m[9] = lu[2] / R; m[13] = 0;
-  m[2] = -L[0] / (d1 - d0); m[6] = -L[1] / (d1 - d0); m[10] = -L[2] / (d1 - d0); m[14] = d1 / (d1 - d0);
-  m[3] = 0; m[7] = 0; m[11] = 0; m[15] = 1;
-  for (let i = 0; i < 16; i++) { UBS[16 + i] = m[i]; UB[16 + i] = m[i]; }
-  for (let i = 0; i < 3; i++) { UB[48 + i] = UBS[48 + i] = SUN[i]; }
-  UBS[32] = 0; UBS[33] = -20; UBS[34] = 0; UBS[35] = 0; UBS[58] = 1;
-  Q.writeBuffer(uboS, 0, UBS);
-}
-
-// ---------------------------------------------------------------- world generation
-await say('Sculpting the seabed…', 0.25, 1200);
-// marks a load in progress (quality.js); leaving the page before it ends is not a crash
-keep('abyssalLoad', 1);
-addEventListener('pagehide', () => keep('abyssalLoad', ''));
-let D;
-{
-  const prims = primBuffer();
-  const m = mod(W_DENS), p = device.createComputePipeline({ layout: 'auto', compute: { module: m, entryPoint: 'main' } });
-  const size = NX * NY * NZ * 4;
-  const u = new ArrayBuffer(48), uu = new Uint32Array(u), uf = new Float32Array(u);
-  uu[0] = NX; uu[1] = NY; uu[2] = NZ; uf[4] = OX; uf[5] = OY; uf[6] = OZ; uf[7] = VS;
-  uu[8] = MESAS.length; uu[9] = ARCHES.length; uu[10] = HOLES.length; uu[11] = CLEARS.length;
-  const bu = buf(new Uint8Array(u), BU.UNIFORM), bp = buf(prims, BU.STORAGE);
-  const bd = device.createBuffer({ size, usage: BU.STORAGE | BU.COPY_SRC }), br = device.createBuffer({ size, usage: BU.MAP_READ | BU.COPY_DST });
-  const bg = device.createBindGroup({ layout: p.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: bu } }, { binding: 1, resource: { buffer: bd } }, { binding: 2, resource: { buffer: bp } }] });
-  const e = device.createCommandEncoder(), c = e.beginComputePass();
-  c.setPipeline(p); c.setBindGroup(0, bg); c.dispatchWorkgroups(NX / 4, NY / 4, NZ / 4); c.end();
-  e.copyBufferToBuffer(bd, 0, br, 0, size);
-  Q.submit([e.finish()]);
-  await br.mapAsync(GPUMapMode.READ);
-  D = new Float32Array(br.getMappedRange().slice(0));
-  br.unmap(); br.destroy(); bd.destroy();
-  // rock connected to the seabed: each column's unbroken run up from the bottom is, and the rock above a gap
-  // (overhangs, specks) is when it touches rock that is. What never connects is a speck of noise floating in
-  // the water (surface nets would make it a small box), so it becomes water
-  const S = NX * NY, R = new Uint8Array(D.length), O = [1, -1, NX, -NX, S, -S], b = new Uint8Array(NX), L = [];
-  for (let i = 0; i < D.length;) { b.fill(1); for (let y = 0; y < NY; y++) for (let x = 0; x < NX; x++, i++) if (D[i] <= 0) b[x] = 0; else if (b[x]) R[i] = 1; else L.push(i); }
-  for (let k = 1; k; L.reverse()) { k = 0; for (const i of L) if (!R[i] && O.some((o) => R[i + o])) R[i] = k = 1; }
-  for (const i of L) if (!R[i]) D[i] = -D[i];
-}
-// Distance to the rock for collide(), in 1/127 m (> 0 in rock, clamped to ±1 m), kept only in the 4x4x4-voxel
-// bricks near the surface within the camera's reach (~2 MB). CI per brick: 0 all water, 1 all rock, n brick n-2 in CG.
-const CO = 52, CN = 102, CI = new Uint16Array(CN * CN * NY / 4);
-let CG = new Int8Array(64 * 65534);
-{
-  let n = 0;
-  for (let bz = 0; bz < CN; bz++) for (let by = 1; by < NY / 4 - 1; by++) for (let bx = 0; bx < CN; bx++) {
-    if (hypot(bx - CN / 2 + 0.5, bz - CN / 2 + 0.5) > 52) continue; // more than 156 m out: never reached
-    let lo = 127, hi = -127;
-    for (let z = 0; z < 4; z++) for (let y = 0; y < 4; y++) for (let x = 0; x < 4; x++) {
-      const i = CO + bx * 4 + x + NX * (by * 4 + y + NY * (CO + bz * 4 + z)), gz = D[i + NX * NY] - D[i - NX * NY];
-      const gx = D[i + 1] - D[i - 1], g = D[i + NX] - D[i - NX], l = sqrt(gx * gx + g * g + gz * gz) / 1.5;
-      const q = round(clamp(D[i] / max(l, 0.05), -1, 1) * 127);
-      CG[n * 64 + x + 4 * y + 16 * z] = q; if (q < lo) lo = q; if (q > hi) hi = q;
-    }
-    CI[bx + CN * (by + NY / 4 * bz)] = lo === hi && lo * lo === 16129 ? +(lo > 0) : (n++, n + 1);
+  // terrain clipmap grid: 11 nested rings of 128x128 cells
+  const NLV = 11, tv = new Int16Array(NLV * 129 * 129 * 4), ti = [];
+  for (let l = 0, o = 0; l < NLV; l++) for (let j = -64; j <= 64; j++) for (let i = -64; i <= 64; i++, o += 4) { tv[o] = i; tv[o + 1] = j; tv[o + 2] = l; }
+  for (let l = 0; l < NLV; l++) for (let j = -64; j < 64; j++) for (let i = -64; i < 64; i++) {
+    if (l && i >= -31 && i < 31 && j >= -31 && j < 31) continue;
+    const a = l * 16641 + (j + 64) * 129 + i + 64; ti.push(a, a + 129, a + 1, a + 1, a + 129, a + 130);
   }
-  CG = CG.slice(0, n * 64);
-}
-await say('Carving canyons…', 0.32, 400);
-const T = buildTerrain(D);
+  const terVB = mkbuf(tv, BU.VERTEX), terIB = mkbuf(new Uint32Array(ti), BU.INDEX), terN = ti.length;
 
-// preset viewpoints (position, look-at), keys 1-6; the world generator dresses the scene around them
-const POSES = [
-  [10, 1.3, 7, -9, -31, -10],
-  [50, 1.3, 34, 58, -23, 8],
-  [-26, 2.2, -100, 0, -9, -108],
-  [-55, 1.5, -18, -60, -30, 8],
-  [10, 1.2, -62, 6, -22, -90],
-  [3, 1.6, 62, 1, -28, 100],
-];
-// 60 s camera path (position + look-at, Catmull-Rom): the world generator keeps it clear, dev.js flies along it
-const FLY = new Float32Array([
-  10, -42.2, 7, -9, -31, -10,
-  7.5, -41.8, 5.5, -10, -31, -12,
-  9, -40.5, 18, 17, -37, 42,
-  22, -39.2, 40, 48, -36, 45,
-  38, -39.2, 46, 57, -27, 18,
-  50, -40.4, 35, 58, -24, 8,
-  55, -39, 20, 60, -18, -10,
-  58, -34, -12, 40, -26, -60,
-  50, -30, -44, 10, -26, -80,
-  30, -30, -70, 4, -28, -90,
-  12, -38.5, -62, 6, -27, -90,
-  -4, -36.5, -70, 0, -14, -100,
-  -16, -37, -84, 0, -22, -108,
-  -29, -38, -90, -44, -34, -60,
-  -41, -38, -70, -56, -34, -40,
-  -53, -38, -50, -60, -34, -20,
-  -58, -38, -28, -60, -32, 0,
-  -57, -38, -10, -60, -30, 16,
-  -60, -38, 10, -50, -36, 40,
-  -52, -37, 36, -20, -35, 44,
-  -22, -38, 43, 4, -38, 52,
-  -6, -39.2, 44.5, 4, -37, 70,
-  3, -40.6, 53, 3, -35, 84,
-  3, -41.5, 62, 1, -30, 100,
-  4, -39, 76, 3, -22, 100,
-]);
-const FLYN = FLY.length / 6, FLYT = 60, LUTN = 1024, flyLUT = new Float32Array(LUTN + 1);
-const flyPts = [];
-// per-frame float state lives in one preallocated array, so the frame loop allocates no heap numbers
-const F = new Float64Array(32), P6 = new Float64Array(6);
-const CX = 0, CY = 1, CZ = 2, YAW = 3, PIT = 4, FX = 5, FY = 6, FZ = 7, RX = 8, RZ = 9, UX = 10, UY = 11, UZ = 12, VX = 13, VY = 14, VZ = 15, TIME = 16, FLT = 17, LAST = 18, GPU = 19, HUDT = 20, SPL = 21, MX = 22, MY = 23, MZ = 24;
-// aim the camera from P6 = position + look-at point
-function aim() {
-  const dx = P6[3] - P6[0], dy = P6[4] - P6[1], dz = P6[5] - P6[2];
-  F[CX] = P6[0]; F[CY] = P6[1]; F[CZ] = P6[2];
-  F[YAW] = atan2(dx, -dz); F[PIT] = atan2(dy, sqrt(dx * dx + dz * dz));
-}
-const lookAt = (x, y, z, tx, ty, tz) => { P6[0] = x; P6[1] = y; P6[2] = z; P6[3] = tx; P6[4] = ty; P6[5] = tz; aim(); };
-// camera spline (Catmull-Rom over position + look-at) at parameter F[SPL]
-function flyRaw() {
-  const s = F[SPL]; let i = floor(s) | 0; if (i > FLYN - 2) i = FLYN - 2;
-  const u = s - i, i0 = (i > 0 ? i - 1 : 0) * 6, i1 = i * 6, i2 = (i + 1) * 6, i3 = (i + 2 < FLYN ? i + 2 : FLYN - 1) * 6;
-  for (let o = 0; o < 6; o++) {
-    const a = FLY[i0 + o], b = FLY[i1 + o], c = FLY[i2 + o], d = FLY[i3 + o];
-    P6[o] = 0.5 * (2 * b + (c - a) * u + (2 * a - 5 * b + 4 * c - d) * u * u + (3 * b - a - 3 * c + d) * u * u * u);
-  }
-  aim();
-}
-{ // arc-length table: flyLUT[k] = spline parameter at fraction k/LUTN of the total path length
-  const M = 4096, len = new Float32Array(M + 1); let px = 0, py = 0, pz = 0;
-  for (let k = 0; k <= M; k++) { F[SPL] = k / M * (FLYN - 1); flyRaw(); if (k) len[k] = len[k - 1] + hypot(F[CX] - px, F[CY] - py, F[CZ] - pz); px = F[CX]; py = F[CY]; pz = F[CZ]; }
-  for (let k = 0, j = 0; k <= LUTN; k++) { const d = k / LUTN * len[M]; while (j < M - 1 && len[j + 1] < d) j++; flyLUT[k] = (j + (d - len[j]) / max(len[j + 1] - len[j], 1e-6)) / M * (FLYN - 1); }
-}
-// camera on the scripted path at time F[FLT]
-function flyAt() {
-  let s = F[FLT] / FLYT; s = s < 0 ? 0 : s > 1 ? 1 : s; s = s * s * (3 - 2 * s) * 0.25 + s * 0.75;
-  s *= LUTN; let k = floor(s) | 0; if (k > LUTN - 1) k = LUTN - 1;
-  F[SPL] = flyLUT[k] + (flyLUT[k + 1] - flyLUT[k]) * (s - k); flyRaw();
-}
-for (let t = 0; t <= FLYT; t += 0.1) { F[FLT] = t; flyAt(); flyPts.push([F[CX], F[CY], F[CZ]]); }
-for (const p of POSES) flyPts.push([p[0], -40, p[2]]);
+  // ---------- layouts + pipelines ----------
+  const VS = GPUShaderStage.VERTEX, FS = GPUShaderStage.FRAGMENT, CS = GPUShaderStage.COMPUTE;
+  const e = (binding, visibility, x) => ({ binding, visibility, ...x });
+  const lite = [e(0, VS | FS | CS, { buffer: {} }), e(1, VS | FS | CS, { texture: { sampleType: 'unfilterable-float' } }), e(2, FS, { texture: {} }), e(3, FS, { texture: {} }), e(4, FS, { sampler: {} })];
+  const liteL = dev.createBindGroupLayout({ entries: lite });
+  const sceneL = dev.createBindGroupLayout({ entries: [...lite, e(5, FS, { texture: { sampleType: 'depth', viewDimension: '2d-array' } }), e(6, FS, { sampler: { type: 'comparison' } }), e(7, FS, { texture: {} }), e(8, FS, { texture: {} }), e(9, FS, { texture: { viewDimension: '3d' } })] });
+  const compL = dev.createBindGroupLayout({ entries: [e(0, CS, { buffer: {} }), e(1, CS, { texture: { sampleType: 'unfilterable-float' } }), e(2, CS, { buffer: { type: 'storage' } }), e(3, CS, { buffer: { type: 'storage' } })] });
+  const dms = { texture: { sampleType: 'depth', multisampled: MSAA > 1 } }, uf = { texture: { sampleType: 'unfilterable-float' } };
+  const volL = dev.createBindGroupLayout({ entries: [e(0, FS, dms)] });
+  const cmpL = dev.createBindGroupLayout({ entries: [e(0, FS, dms), e(1, FS, uf), e(2, FS, uf), e(3, FS, uf)] });
+  const blitL = dev.createBindGroupLayout({ entries: [e(0, FS, { texture: {} }), e(1, FS, { sampler: {} })] });
+  const fix = s => MSAA > 1 ? s : s.replace(/texture_depth_multisampled_2d/g, 'texture_depth_2d');
+  const check = async (m, n, c) => { const i = await m.getCompilationInfo(); for (const x of i.messages) if (x.type == 'error') console.error(n, x.message, '@@', (c || '').split('\n')[x.lineNum - 1].slice(Math.max(0, x.linePos - 90), x.linePos + 30)); return m; };
+  const mR = await check(dev.createShaderModule({ code: renderWGSL }), 'render', renderWGSL);
+  const mP = await check(dev.createShaderModule({ code: fix(postWGSL) }), 'post', fix(postWGSL));
+  const mB = dev.createShaderModule({ code: blitWGSL });
+  const cw = computeWGSL(NK, LB, LC, KT, KS), mC = await check(dev.createShaderModule({ code: cw }), 'compute', cw);
+  const G = new Float32Array(256), gB = dev.createBuffer({ size: 1024, usage: BU.UNIFORM | BU.COPY_DST });
+  const bgE = [{ binding: 0, resource: { buffer: gB } }, { binding: 1, resource: macroT.createView() }, { binding: 2, resource: noiseT.createView() }, { binding: 3, resource: atlasT.createView() }, { binding: 4, resource: samp }];
+  const liteG = dev.createBindGroup({ layout: liteL, entries: bgE });
+  const sceneG = dev.createBindGroup({ layout: sceneL, entries: [...bgE, { binding: 5, resource: shadowT.createView({ dimension: '2d-array' }) }, { binding: 6, resource: sampC }, { binding: 7, resource: impC.createView() }, { binding: 8, resource: impN.createView() }, { binding: 9, resource: noise3.createView() }] });
+  const compG = dev.createBindGroup({ layout: compL, entries: [bgE[0], bgE[1], { binding: 2, resource: { buffer: instB } }, { binding: 3, resource: { buffer: drawB } }] });
+  const PL = (...l) => dev.createPipelineLayout({ bindGroupLayouts: l });
+  const meshBuf = { arrayStride: 32, attributes: [{ shaderLocation: 0, offset: 0, format: 'float32x3' }, { shaderLocation: 1, offset: 12, format: 'snorm8x4' }, { shaderLocation: 2, offset: 16, format: 'float32x2' }, { shaderLocation: 3, offset: 24, format: 'unorm8x4' }, { shaderLocation: 4, offset: 28, format: 'unorm8x4' }] };
+  const instBuf = { arrayStride: 32, stepMode: 'instance', attributes: [{ shaderLocation: 5, offset: 0, format: 'float32x4' }, { shaderLocation: 6, offset: 16, format: 'float32x4' }] };
+  const HDR = 'rgba16float', DF = 'depth32float', ms4 = { count: MSAA };
+  const dsMain = (w, c = 'greater') => ({ format: DF, depthWriteEnabled: w, depthCompare: c });
+  const RP = (layout, vs, fs, o) => dev.createRenderPipeline({ layout, vertex: { module: o.m || mR, entryPoint: vs, buffers: o.buffers || [], constants: o.constants }, fragment: fs ? { module: o.m || mR, entryPoint: fs, targets: o.targets, constants: o.constants } : undefined, primitive: { topology: o.topo || 'triangle-list', cullMode: 'none' }, depthStencil: o.ds, multisample: o.ms });
+  const pTer = RP(PL(sceneL), 'vt', 'ft', { buffers: [{ arrayStride: 8, attributes: [{ shaderLocation: 0, offset: 0, format: 'sint16x4' }] }], targets: [{ format: HDR }], ds: dsMain(true), ms: ms4 });
+  const pVeg = RP(PL(sceneL), 'vv', 'fv', { buffers: [meshBuf, instBuf], targets: [{ format: HDR }], ds: dsMain(true), ms: { count: MSAA, alphaToCoverageEnabled: MSAA > 1 } });
+  const pImp = RP(PL(sceneL), 'vi', 'fi', { buffers: [instBuf], topo: 'triangle-strip', targets: [{ format: HDR }], ds: dsMain(true), ms: { count: MSAA, alphaToCoverageEnabled: MSAA > 1 } });
+  const pSky = RP(PL(sceneL), 'vq', 'fsky', { topo: 'triangle-strip', targets: [{ format: HDR }], ds: dsMain(false, 'equal'), ms: ms4 });
+  const pPar = RP(PL(sceneL), 'vp', 'fp', { topo: 'triangle-strip', targets: [{ format: HDR, blend: { color: { srcFactor: 'one', dstFactor: 'one' }, alpha: { srcFactor: 'zero', dstFactor: 'one' } } }], ds: dsMain(false), ms: ms4 });
+  const pSh = [0, 1].map(c => RP(PL(liteL), 'vs', 'fs', { buffers: [meshBuf, instBuf], targets: [], constants: { CASC: c }, ds: { format: DF, depthWriteEnabled: true, depthCompare: 'less', depthBias: 2, depthBiasSlopeScale: 2.5 } }));
+  const pBake = RP(PL(liteL), 'vb', 'fb', { buffers: [meshBuf, instBuf], targets: [{ format: 'rgba8unorm-srgb' }, { format: 'rgba8unorm' }], ds: { format: DF, depthWriteEnabled: true, depthCompare: 'less' } });
+  const pVol = RP(PL(sceneL, volL), 'vq', 'fvol', { m: mP, topo: 'triangle-strip', targets: [{ format: HDR }, { format: 'r16float' }] });
+  const pCmp = RP(PL(sceneL, cmpL), 'vq', 'fcomp', { m: mP, topo: 'triangle-strip', targets: [{ format: fmt }] });
+  const pCom = ['trees', 'under', 'grass', 'life'].map(n => dev.createComputePipeline({ layout: PL(compL), compute: { module: mC, entryPoint: n } }));
 
-await say('Growing kelp…', 0.73, 2500);
-const Wd = makeWorld(D, T, flyPts, POSES);
-for (const p of POSES) p[1] += Wd.gy(p[0], p[2]);
-D = Wd.gy = T.smp = null; // with gy goes the generator's working memory (about 200 MB)
-
-await say('Building set pieces…', 0.94, 1200);
-// mesh ids: 0-3 boulders, 4-6 sponges, 7-8 coral, 9 tube sponge, 10 whale fluke, 11 ship, 12 manta, 13 fish,
-// 14-20 rock chunks + pebbles, 21-22 coral LOD, 23-25 far LOD of the large rock chunks
-const meshes = [meshChunk(1, 3), meshChunk(7, 3), meshChunk(13, 3), meshChunk(22, 3),
-  meshLathe([[0, 0, 0.5], [0.34, 0, 0.6], [0.5, 0.2, 0.85], [0.6, 0.6, 1], [0.55, 0.95, 1], [0.47, 1.08, 1], [0.38, 1.1, 0.9], [0.3, 1.0, 0.45], [0.26, 0.6, 0.15], [0, 0.35, 0.05]], 18, 0.3, 9),
-  meshLathe([[0, 0, 0.5], [0.2, 0, 0.6], [0.26, 0.5, 0.85], [0.4, 1.25, 1], [0.4, 1.42, 1], [0.33, 1.48, 0.9], [0.26, 1.38, 0.4], [0.18, 0.8, 0.12], [0, 0.5, 0.05]], 16, 0.35, 8),
-  meshLathe([[0, 0, 0.5], [0.5, 0, 0.7], [0.72, 0.18, 1], [0.74, 0.38, 1], [0.62, 0.5, 0.9], [0.48, 0.42, 0.45], [0.4, 0.2, 0.15], [0, 0.14, 0.06]], 18, 0.25, 10),
-  meshCoral(0), meshCoral(1), meshTubes()].map((m) => m.build());
-meshes.push(meshFluke(), meshShip().build(), meshManta().build(), meshFish().build(),
-  meshChunk(3).build(), meshChunk(11).build(), meshChunk(29).build(), meshChunk(5, 3).build(), meshChunk(17, 3).build(), meshChunk(41, 3).build(), meshChunk(9, 1).build(), meshCoral(0, 1).build(), meshCoral(1, 1).build(), meshChunk(5, 2, 1).build(), meshChunk(17, 2, 1).build(), meshChunk(41, 2, 1).build());
-let nV = 0, nI = 0;
-for (const m of meshes) { m.v0 = nV; m.i0 = nI; nV += m.nv; nI += m.ib.length; }
-const allV = new Uint8Array(nV * 16), allI = new Uint32Array(nI);
-for (const m of meshes) { allV.set(new Uint8Array(m.vb), m.v0 * 16); allI.set(m.ib, m.i0); }
-const vbMesh = buf(allV, BU.VERTEX), ibMesh = buf(allI, BU.INDEX);
-const vbTerrain = buf(new Uint8Array(T.vb), BU.VERTEX), ibTerrain = buf(T.ib, BU.INDEX);
-const nSolid = Wd.solids.data.length / 12;
-const solidData = new Float32Array((nSolid + 1) * 12); solidData.set(Wd.solids.data); solidData.set([0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 0], nSolid * 12);
-const ibSolids = buf(solidData, BU.VERTEX);
-const ibChunk = Wd.chunks.map((c) => buf(c.data, BU.VERTEX)), ibProp = Wd.props.map((c) => buf(c.data, BU.VERTEX));
-const ibBig = buf(new Uint8Array(Wd.big.buf), BU.VERTEX), ibBigF = buf(new Uint8Array(Wd.bigF.buf), BU.VERTEX), ibSmall = buf(new Uint8Array(Wd.small.buf), BU.VERTEX);
-const ibFish = buf(Wd.fish, BU.VERTEX), ibManta = buf(Wd.mantas, BU.VERTEX), ibBubbles = buf(Wd.bubbles, BU.VERTEX), ibSnowB = buf(Wd.snow, BU.VERTEX);
-const ibGl = buf(Wd.glints, BU.VERTEX), nGl = Wd.glints.length / 8;
-const nFish = Wd.fish.length / 8, nManta = Wd.mantas.length / 8, nBub = Wd.bubbles.length / 8, nSnow = Wd.snow.length / 4;
-const MANTA = meshes[12], FISH = meshes[13];
-Q.writeTexture({ texture: tVol }, Wd.volD, { bytesPerRow: NX, rowsPerImage: NY / 2 }, [NX / 2, NY / 2, NZ / 2]);
-Q.writeTexture({ texture: tMap }, Wd.gm, { bytesPerRow: 2048 }, [512, 512]);
-
-// ---------------------------------------------------------------- one-time bakes: detail texture, shadow map
-{
-  const m = mod(W_DETAIL), p = device.createRenderPipeline({ layout: 'auto', vertex: { module: m, entryPoint: 'vs' }, fragment: { module: m, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }] } });
-  const e = device.createCommandEncoder();
-  let r = e.beginRenderPass({ colorAttachments: [colorAtt(tDetail.createView({ baseMipLevel: 0, mipLevelCount: 1 }), true)] });
-  r.setPipeline(p); r.draw(3); r.end();
-  for (let i = 1; i < 11; i++) {
-    r = e.beginRenderPass({ colorAttachments: [colorAtt(tDetail.createView({ baseMipLevel: i, mipLevelCount: 1 }), true)] });
-    r.setPipeline(pMip8); r.setBindGroup(0, blitBG(tDetail.createView({ baseMipLevel: i - 1, mipLevelCount: 1 }))); r.draw(3); r.end();
-  }
-  r = e.beginRenderPass({ colorAttachments: [], depthStencilAttachment: { view: tShadow.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' } });
-  r.setBindGroup(0, bg0s);
-  r.setPipeline(pTerrSh);
-  r.setVertexBuffer(0, vbTerrain); r.setVertexBuffer(1, ibSolids); r.setIndexBuffer(ibTerrain, 'uint32');
-  r.drawIndexed(T.ib.length, 1, 0, 0, nSolid);
-  r.setPipeline(pSolidSh); r.setVertexBuffer(0, vbMesh); r.setIndexBuffer(ibMesh, 'uint32');
-  for (let i = 0; i < 12; i++) { const g = Wd.solids.ranges[i]; if (g[1]) r.drawIndexed(meshes[i].ib.length, g[1], meshes[i].i0, meshes[i].v0, g[0]); }
-  // small rocks, sponges and corals (~35M triangles) only on High: too much for a phone's driver
-  if (!LV) for (let i = 0; i < NCHUNK; i++) { r.setVertexBuffer(1, ibChunk[i]); r.drawIndexed(meshes[14 + i].ib.length, Wd.chunks[i].n, meshes[14 + i].i0, meshes[14 + i].v0, 0); }
-  if (!LV) for (let i = 0; i < 6; i++) if (Wd.props[i].n) { r.setVertexBuffer(1, ibProp[i]); r.drawIndexed(meshes[4 + i].ib.length, Wd.props[i].n, meshes[4 + i].i0, meshes[4 + i].v0, 0); }
-  r.setPipeline(pLeafSh); r.setVertexBuffer(0, ibBig); r.draw(6, Wd.big.n);
-  r.end();
-  Q.submit([e.finish()]);
-}
-// the GPU has its own copies now: let go of the generator's (about 300 MB)
-for (const o of [Wd.big, Wd.bigF, Wd.small, ...Wd.chunks, ...Wd.props]) o.buf = o.data = 0;
-Wd.glints = Wd.volD = Wd.gm = T.vb = T.ib = T.wp = T.wn = 0;
-
-// ---------------------------------------------------------------- render targets (rebuilt on resize)
-// The scene is drawn at `pix` pixels and scaled up to the window. frame() tunes it and the draw distance scale `det`
-// for 60 fps; both start where the last visit left them.
-const PIXMAX = 2560 * 1440, PIXMIN = mob ? 25e4 : 5e5, DETMIN = 0.4;
-let W = 0, H = 0, DW = 0, DH = 0, pix = +SV[1] || (LV > 1 ? 41e4 : mob ? 1280 * 720 : PIXMAX), det = +SV[2] || 1, dynN = 0, dynT = 0, dynG = 0, dynGN = 0, dynBad = 0, dynOk = 0, dynWait = 3;
-let passScene, passRays, passBlur, bgBlur, passPost, bgRays, bgPost, bloomPass = [], bloomBG = [], targets = [];
-const NB = 6;
-function resize() {
-  DW = max(2, round(canvas.clientWidth * devicePixelRatio)); DH = max(2, round(canvas.clientHeight * devicePixelRatio));
-  const s = min(1, sqrt(pix / (DW * DH)));
-  const w = max(2, round(DW * s) & ~1), h = max(2, round(DH * s) & ~1);
-  if (w === W && h === H) return;
-  dynN = dynG = dynGN = 0; dynT = -300; // let the new size settle before measuring again
-  W = w; H = h; canvas.width = W; canvas.height = H;
-  ctx.configure({ device, format: FMT, alphaMode: 'opaque' });
-  for (const t of targets) t.destroy();
-  const tMS = tex(AA > 1 ? W : 1, H, HDR, TU.RENDER_ATTACHMENT, { samples: AA }), tDp = tex(W, H, DEPTH, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING, { samples: AA });
-  const tRes = tex(W, H, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING), tRay = tex(W / 2, H / 2, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING), tRay2 = tex(W / 2, H / 2, HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING);
-  targets = [tMS, tDp, tRes, tRay, tRay2];
-  const bl = [];
-  for (let i = 0; i < NB; i++) { const t = tex(max(1, W >> (i + 1)), max(1, H >> (i + 1)), HDR, TU.RENDER_ATTACHMENT | TU.TEXTURE_BINDING); bl.push(t); targets.push(t); }
-  const vDp = tDp.createView(), vRes = tRes.createView(), vRay = tRay.createView(), vRay2 = tRay2.createView(), vBl = bl.map((t) => t.createView());
-  // without anti-aliasing (Low) the scene goes straight into the resolve target, and tMS is one unused column
-  passScene = { colorAttachments: [{ view: AA > 1 ? tMS.createView() : vRes, resolveTarget: AA > 1 ? vRes : undefined, loadOp: 'clear', storeOp: AA > 1 ? 'discard' : 'store', clearValue: [0, 0, 0, 1] }],
-    depthStencilAttachment: { view: vDp, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'store' } };
-  passRays = { colorAttachments: [colorAtt(vRay, true)] };
-  passBlur = { colorAttachments: [colorAtt(vRay2, true)] };
-  bgBlur = device.createBindGroup({ layout: pRB.getBindGroupLayout(0), entries: [{ binding: 0, resource: vRay }] });
-  passPost = { colorAttachments: [{ view: null, loadOp: 'clear', storeOp: 'store', clearValue: [0, 0, 0, 1] }] };
-  bgRays = device.createBindGroup({ layout: pRays.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ubo } }, { binding: 1, resource: sRep }, { binding: 2, resource: sCmp },
-    { binding: 3, resource: tShadow.createView() }, { binding: 4, resource: tWater.createView() }, { binding: 5, resource: vDp }, { binding: 6, resource: tVol.createView() }, { binding: 7, resource: sClamp }] });
-  bgPost = device.createBindGroup({ layout: pPost.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: ubo } }, { binding: 1, resource: sClamp }, { binding: 2, resource: vRes },
-    { binding: 3, resource: vRay2 }, { binding: 4, resource: vBl[0] }, { binding: 5, resource: vDp }] });
-  bloomPass = []; bloomBG = [];
-  // down: res -> b0 -> ... -> b5 ; up: b5 -> b4 (additive) ... -> b0
-  for (let i = 0; i < NB; i++) { bloomPass.push({ colorAttachments: [colorAtt(vBl[i], true)] }); bloomBG.push(blitBG(i ? vBl[i - 1] : vRes)); }
-  for (let i = NB - 1; i > 0; i--) { bloomPass.push({ colorAttachments: [colorAtt(vBl[i - 1], false)] }); bloomBG.push(blitBG(vBl[i])); }
-  UB[52] = W; UB[53] = H; UB[54] = 1 / W; UB[55] = 1 / H;
-}
-resize();
-addEventListener('resize', resize);
-
-// ---------------------------------------------------------------- timing (GPU timestamp queries)
-let qs, qResolve, qRead = [], tsBegin, tsEnd;
-if (hasTS) {
-  qs = device.createQuerySet({ type: 'timestamp', count: 2 });
-  qResolve = device.createBuffer({ size: 16, usage: BU.QUERY_RESOLVE | BU.COPY_SRC });
-  for (let i = 0; i < 6; i++) {
-    const b = device.createBuffer({ size: 16, usage: BU.MAP_READ | BU.COPY_DST });
-    const o = { b, busy: false, done: null };
-    o.done = () => {
-      const a = new BigInt64Array(b.getMappedRange());
-      const ms = Number(a[1] - a[0]) / 1e6; F[GPU] = ms; b.unmap(); o.busy = false;
-      if (dynT > 0 && ms > 0 && ms < 1e3) { dynG += ms; dynGN++; }
-    };
-    qRead.push(o);
-  }
-  tsBegin = { querySet: qs, beginningOfPassWriteIndex: 0 }; tsEnd = { querySet: qs, endOfPassWriteIndex: 1 };
-}
-
-// ---------------------------------------------------------------- frame
-let hud = false;
-let kf = 0, kb = 0, kl = 0, kr = 0, ku = 0, kd = 0, ks = 0, mdx = 0, mdy = 0, lkx = 0, lky = 0, l2x = 0, l2y = 0, hN = 0, hMax = 0, hMin = 1e9, hPer = 1e9, hLate = 0, hTot = 0, tId = -1, tN = 0, tx0 = 0, ty0 = 0, tx = 0, ty = 0;
-const TANH = 0.6, NEAR = 0.1, EXPO = 0.62, RAYS = 0.54;
-const submitList = [null];
-const rowOrd = new Uint8Array(CELLS);
-// Draws the cells of a cell-sorted buffer that are in view and within [minD, maxD) (scaled by `det`, but not for the
-// terrain) as merged runs, nearest rows first.
-function drawCells(r, start, lo, hi, mar, indexed, verts, minD, maxD) {
-  const cx = F[CX], cy = F[CY], cz = F[CZ], fx = F[FX], fy = F[FY], fz = F[FZ], rx = F[RX], rz = F[RZ], ux = F[UX], uy = F[UY], uz = F[UZ];
-  const ds = indexed === 1 ? 1 : det * det;
-  const tx = TANH * W / H, hw = CELLW * 0.5, ex = hw + mar, min2 = minD * minD * ds, max2 = maxD * maxD * ds;
-  for (let k = 0; k < CELLS; k++) {
-    const rw = rowOrd[k], row = rw * CELLS, pz = OZ + (rw + 0.5) * CELLW - cz, hz = max(abs(pz) - hw, 0);
-    let run = -1;
-    for (let x = 0; x <= CELLS; x++) {
-      const c = row + x; let v = false;
-      if (x < CELLS) {
-        const l = lo[c], h = hi[c];
-        if (l <= h) {
-          const px = OX + (x + 0.5) * CELLW - cx, py = (l + h) * 0.5 - cy, ey = (h - l) * 0.5 + mar, hx = max(abs(px) - hw, 0), h2 = hx * hx + hz * hz;
-          if (h2 < max2 && h2 >= min2) {
-            const lim = px * fx + py * fy + pz * fz + ex * abs(fx) + ey * abs(fy) + ex * abs(fz);
-            if (lim >= 0 && abs(px * rx + pz * rz) - ex * (abs(rx) + abs(rz)) <= lim * tx) v = abs(px * ux + py * uy + pz * uz) - ex * (abs(ux) + abs(uz)) - ey * abs(uy) <= lim * TANH;
-          }
-        }
-      }
-      if (v) { if (run < 0) run = c; } else if (run >= 0) {
-        const a = start[run], n = start[c] - a;
-        if (n > 0) { if (indexed === 1) r.drawIndexed(n * 6, 1, a * 6, 0, nSolid); else if (indexed) r.drawIndexed(indexed.ib.length, n, indexed.i0, indexed.v0, a); else r.draw(verts, n, 0, a); }
-        run = -1;
-      }
-    }
-  }
-}
-function render() {
-  // camera basis (right vector is horizontal)
-  const cx = F[CX], cy = F[CY], cz = F[CZ], pitch = F[PIT], yaw = F[YAW];
-  const cp = cos(pitch), fy = sin(pitch), rx = cos(yaw), rz = sin(yaw), fx = cp * rz, fz = -cp * rx;
-  const ux = -rz * fy, uy = rz * fx - rx * fz, uz = rx * fy;
-  F[FX] = fx; F[FY] = fy; F[FZ] = fz; F[RX] = rx; F[RZ] = rz; F[UX] = ux; F[UY] = uy; F[UZ] = uz;
-  const asp = W / H, sx = 1 / (TANH * asp), sy = 1 / TANH, m = UB;
-  m[0] = rx * sx; m[4] = 0; m[8] = rz * sx; m[12] = -(rx * cx + rz * cz) * sx;
-  m[1] = ux * sy; m[5] = uy * sy; m[9] = uz * sy; m[13] = -(ux * cx + uy * cy + uz * cz) * sy;
-  m[2] = 0; m[6] = 0; m[10] = 0; m[14] = NEAR;
-  m[3] = fx; m[7] = fy; m[11] = fz; m[15] = -(fx * cx + fy * cy + fz * cz);
-  m[32] = cx; m[33] = cy; m[34] = cz; m[35] = F[TIME];
-  m[36] = rx; m[37] = 0; m[38] = rz; m[39] = TANH * asp;
-  m[40] = ux; m[41] = uy; m[42] = uz; m[43] = TANH;
-  m[44] = fx; m[45] = fy; m[46] = fz; m[47] = NEAR;
-  const zx = cx - PURPLE[0], zz = cz - PURPLE[1]; let zt = (44 - sqrt(zx * zx + zz * zz)) / 18; zt = zt < 0 ? 0 : zt > 1 ? 1 : zt;
-  m[51] = zt * zt * (3 - 2 * zt);
-  let ek = (-cy - 8) / 26; ek = ek < 0 ? 0 : ek > 1 ? 1 : ek;
-  m[56] = EXPO * (0.6 + 0.4 * ek); m[57] = RAYS; m[58] = det;
-  Q.writeBuffer(ubo, 0, UB);
-  WT[0] = F[TIME]; Q.writeBuffer(uboW, 0, WT);
-
-  { let cr = floor((cz - OZ) / CELLW) | 0; cr = cr < 0 ? 0 : cr > CELLS - 1 ? CELLS - 1 : cr; let n = 0; rowOrd[n++] = cr; for (let d = 1; d < CELLS; d++) { if (cr - d >= 0) rowOrd[n++] = cr - d; if (cr + d < CELLS) rowOrd[n++] = cr + d; } }
-  const e = device.createCommandEncoder();
-  let slot = null;
-  if (hasTS) { for (let i = 0; i < qRead.length; i++) if (!qRead[i].busy) { slot = qRead[i]; break; } }
-  waterPass[0].timestampWrites = slot ? tsBegin : undefined;
-  passPost.timestampWrites = slot ? tsEnd : undefined;
-  // animated water texture + mips
-  let r = e.beginRenderPass(waterPass[0]); r.setPipeline(pWater); r.setBindGroup(0, bgWater); r.draw(3); r.end();
-  for (let i = 1; i < 5; i++) { r = e.beginRenderPass(waterPass[i]); r.setPipeline(pMip16); r.setBindGroup(0, waterBG[i - 1]); r.draw(3); r.end(); }
-  // scene
-  r = e.beginRenderPass(passScene);
-  r.setBindGroup(0, bg0);
-  r.setPipeline(pTerrain); r.setVertexBuffer(0, vbTerrain); r.setVertexBuffer(1, ibSolids); r.setIndexBuffer(ibTerrain, 'uint32');
-  drawCells(r, T.start, T.lo, T.hi, 1.5, 1, 0, 0, 240);
-  r.setPipeline(pSolid); r.setVertexBuffer(0, vbMesh); r.setIndexBuffer(ibMesh, 'uint32');
-  for (let i = 0; i < 12; i++) { const g = Wd.solids.ranges[i]; if (g[1]) r.drawIndexed(meshes[i].ib.length, g[1], meshes[i].i0, meshes[i].v0, g[0]); }
-  for (let i = 0; i < NCHUNK; i++) {
-    const c = Wd.chunks[i], big = i > 2 && i < 6; r.setVertexBuffer(1, ibChunk[i]);
-    drawCells(r, c.start, c.lo, c.hi, 3, meshes[14 + i], 0, 0, i > 5 ? 30 : big ? 40 : 96);
-    if (big) drawCells(r, c.start, c.lo, c.hi, 3, meshes[20 + i], 0, 40, 150);
-  }
-  for (let i = 0; i < 6; i++) {
-    const lod = i === 3 || i === 4; r.setVertexBuffer(1, ibProp[i]);
-    drawCells(r, Wd.props[i].start, Wd.props[i].lo, Wd.props[i].hi, 3, meshes[4 + i], 0, 0, lod ? 6 : 110);
-    if (lod) drawCells(r, Wd.props[i].start, Wd.props[i].lo, Wd.props[i].hi, 3, meshes[18 + i], 0, 6, 110);
-  }
-  r.setPipeline(pManta); r.setVertexBuffer(1, ibManta); r.drawIndexed(MANTA.ib.length, nManta, MANTA.i0, MANTA.v0, 0);
-  r.setPipeline(pFish); r.setVertexBuffer(1, ibFish); r.drawIndexed(FISH.ib.length, nFish, FISH.i0, FISH.v0, 0);
-  // kelp and plants: 9-row blades up close, 5 rows mid-range, a decimated set far away
-  r.setPipeline(pLeaf); r.setVertexBuffer(0, ibBig); drawCells(r, Wd.big.start, Wd.big.lo, Wd.big.hi, 5, false, 18, 0, 24);
-  r.setPipeline(pLeaf5); drawCells(r, Wd.big.start, Wd.big.lo, Wd.big.hi, 5, false, 10, 24, 58);
-  r.setPipeline(pLeafF); r.setVertexBuffer(0, ibBigF); drawCells(r, Wd.bigF.start, Wd.bigF.lo, Wd.bigF.hi, 5, false, 6, 58, 150);
-  r.setPipeline(pLeafS); r.setVertexBuffer(0, ibSmall); drawCells(r, Wd.small.start, Wd.small.lo, Wd.small.hi, 1.5, false, 6, 0, 70);
-  r.setPipeline(pSurf); r.draw(4);
-  r.setPipeline(pBack); r.draw(4);
-  r.setPipeline(pBub); r.setVertexBuffer(0, ibBubbles); r.draw(4, nBub);
-  r.setPipeline(pGl); r.setVertexBuffer(0, ibGl); r.draw(4, nGl);
-  r.setPipeline(pSnow); r.setVertexBuffer(0, ibSnowB); r.draw(4, nSnow);
-  r.end();
-  // light shafts
-  r = e.beginRenderPass(passRays); r.setPipeline(pRays); r.setBindGroup(0, bgRays); r.draw(3); r.end();
-  r = e.beginRenderPass(passBlur); r.setPipeline(pRB); r.setBindGroup(0, bgBlur); r.draw(3); r.end();
-  // bloom
-  for (let i = 0; i < bloomPass.length; i++) {
-    r = e.beginRenderPass(bloomPass[i]); r.setPipeline(i === 0 ? pDown0 : i < NB ? pDown : pUp); r.setBindGroup(0, bloomBG[i]); r.draw(3); r.end();
-  }
-  // composite
-  passPost.colorAttachments[0].view = ctx.getCurrentTexture().createView();
-  r = e.beginRenderPass(passPost); r.setPipeline(pPost); r.setBindGroup(0, bgPost); r.draw(3); r.end();
-  if (slot) { e.resolveQuerySet(qs, 0, 2, qResolve, 0); e.copyBufferToBuffer(qResolve, 0, slot.b, 0, 16); }
-  submitList[0] = e.finish();
-  Q.submit(submitList);
-  if (slot) { slot.busy = true; slot.b.mapAsync(GPUMapMode.READ).then(slot.done); }
-}
-
-// CS[j] = distance to the rock (metres, < 0 in water) at the camera + CE[3j..3j+2]: the camera, then ±0.375 m on
-// each axis for the gradient
-const CE = new Float64Array([0, 0, 0, .375, 0, 0, -.375, 0, 0, 0, .375, 0, 0, -.375, 0, 0, 0, .375, 0, 0, -.375]), CS = new Float64Array(7);
-const cv = (x, y, z) => { const b = CI[(x >> 2) + CN * ((y >> 2) + NY / 4 * (z >> 2))]; return b > 1 ? CG[b * 64 - 128 + (x & 3) + 4 * (y & 3) + 16 * (z & 3)] : b * 254 - 127; };
-function sd(j) {
-  const x = (F[CX] + CE[j * 3] - OX) / VS - CO, y = (F[CY] + CE[j * 3 + 1] - OY) / VS, z = (F[CZ] + CE[j * 3 + 2] - OZ) / VS - CO;
-  const ix = x | 0, iy = y | 0, iz = z | 0, u = x - ix, v = y - iy, a = cv(ix, iy, iz), b = cv(ix, iy + 1, iz), c = cv(ix, iy, iz + 1), d = cv(ix, iy + 1, iz + 1);
-  const p = a + (cv(ix + 1, iy, iz) - a) * u, q = b + (cv(ix + 1, iy + 1, iz) - b) * u, r = c + (cv(ix + 1, iy, iz + 1) - c) * u, s = d + (cv(ix + 1, iy + 1, iz + 1) - d) * u;
-  const e = p + (q - p) * v; CS[j] = (e + (r + (s - r) * v - e) * (z - iz)) / 127;
-}
-// Moves the camera by F[MX..MZ] in steps shorter than its radius CR (so it can't pass through thin rock), pushing it
-// back out after each step and dropping velocity into the rock, so it slides along.
-const CR = 0.5;
-function collide() {
-  const n = floor(sqrt(F[MX] * F[MX] + F[MY] * F[MY] + F[MZ] * F[MZ]) / 0.4) + 1;
-  for (let i = 0; i < n; i++) {
-    F[CX] += F[MX] / n; F[CY] += F[MY] / n; F[CZ] += F[MZ] / n;
-    for (let k = 0; k < 2; k++) {
-      sd(0); const s = CS[0] + CR; if (s <= 0) break;
-      for (let j = 1; j < 7; j++) sd(j);
-      let gx = CS[1] - CS[2], gy = CS[3] - CS[4], gz = CS[5] - CS[6]; const l = sqrt(gx * gx + gy * gy + gz * gz);
-      if (l < 0.075) break; // flat: deep in rock
-      gx /= l; gy /= l; gz /= l; const vn = F[VX] * gx + F[VY] * gy + F[VZ] * gz;
-      F[CX] -= gx * s; F[CY] -= gy * s; F[CZ] -= gz * s;
-      if (vn > 0) { F[VX] -= gx * vn; F[VY] -= gy * vn; F[VZ] -= gz * vn; }
-    }
-  }
-}
-
-function frame(now) {
-  requestAnimationFrame(frame);
-  const dtr = now - F[LAST]; F[LAST] = now;
-  let dt = dtr / 1000; if (dt > 0.1) dt = 0.1;
-  // Dynamic resolution for 60 fps: every second (0.4 s behind the menu) scale the load by k
-  if (dtr < 1e3 && (dynT += dtr) > 0 && (dynN++, dynT > (menu ? 400 : 1000))) {
-    const a = dynT / dynN, g = dynGN ? dynG / dynGN : 0; let k = 1;
-    // with GPU timing: keep it between 9.8 and 13.6 ms
-    if (g) { if (g > 13.6 || g < 9.8) k = 11.7 / g; }
-    // without: slow for two periods in a row means fewer pixels, and twice as long before trying to go back up
-    else if (a > 17.6) { dynOk = 0; if (++dynBad > 1) { k = 15 / a; dynBad = 0; dynWait = min(dynWait * 2, 60); } }
-    // at the display's rate there is no telling if there is room, so try a little more now and then
-    else { dynBad = 0; if (a < 12.5) k = 15 / a; else if (++dynOk > dynWait) { k = 1.17; dynOk = 0; } }
-    k = k < 0.5 ? 0.5 : k > 1.7 ? 1.7 : k; const top = min(PIXMAX, DW * DH), mid = max(top / 2, PIXMIN), was = pix + det;
-    // too slow: pixels down to `mid` first, then draw distance, then the remaining pixels; faster goes back the same way
-    if (k < 1 ? pix > mid || det <= DETMIN : pix < mid || det >= 1) {
-      const end = k < 1 ? (det > DETMIN ? mid : PIXMIN) : det < 1 ? mid : top;
-      pix *= k; if (k < 1 ? pix < end : pix > end) pix = end;
-    } else { det *= sqrt(k); det = det < DETMIN ? DETMIN : det > 1 ? 1 : det; }
-    if (was !== pix + det) keep('abyssal', [LV, pix < top ? pix | 0 : '', det]); // nothing kept at full resolution
-    dynN = dynT = dynG = dynGN = 0; resize();
-  }
-  F[TIME] += dt;
+  // ---------- bake tree impostors (albedo + normal atlases) ----------
   {
-    // touch: holding the finger away from where it went down keeps turning, like a joystick
-    if (tId >= 0) {
-      const tr = 4 / (innerWidth < innerHeight ? innerWidth : innerHeight); let jx = (tx - tx0) * tr, jy = (ty - ty0) * tr;
-      jx = jx > 1 ? 1 : jx < -1 ? -1 : jx; jy = jy > 1 ? 1 : jy < -1 ? -1 : jy;
-      lkx += jx * 1.5 * dt; lky += jy * dt;
+    const bi = new Float32Array(12 * 8);
+    for (let k = 0; k < 12; k++) { const E = Math.max(ms.info[k].hw, ms.info[k].ht / 2) * 1.03; bi[k * 8 + 3] = 1; bi[k * 8 + 6] = 1; bi[k * 8 + 7] = E; G[192 + k * 4] = E; G[193 + k * 4] = ms.info[k].ht; }
+    dev.queue.writeBuffer(bakeB, 0, bi); G[108] = W.S; dev.queue.writeBuffer(gB, 0, G);
+    const en = dev.createCommandEncoder(), bd = dev.createTexture({ size: [IW, IH], format: DF, usage: RA });
+    const p = en.beginRenderPass({ colorAttachments: [{ view: impC.createView({ baseMipLevel: 0, mipLevelCount: 1 }), loadOp: 'clear', storeOp: 'store', clearValue: [.045, .085, .03, 0] }, { view: impN.createView({ baseMipLevel: 0, mipLevelCount: 1 }), loadOp: 'clear', storeOp: 'store', clearValue: [.5, .8, .8, .7] }], depthStencilAttachment: { view: bd.createView(), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'discard' } });
+    p.setPipeline(pBake); p.setBindGroup(0, liteG); p.setVertexBuffer(0, meshVB); p.setIndexBuffer(meshIB, 'uint32');
+    for (let k = 0; k < 12; k++) { p.setViewport((k & 3) * 512, (k >> 2) * 512, 512, 512, 0, 1); p.setVertexBuffer(1, bakeB, k * 32); p.drawIndexed(ms.info[k].count, 1, ms.info[k].first, ms.info[k].base); }
+    p.end();
+    for (const [t, f] of [[impC, 'rgba8unorm-srgb'], [impN, 'rgba8unorm']]) {
+      const pb = dev.createRenderPipeline({ layout: PL(blitL), vertex: { module: mB, entryPoint: 'vq' }, fragment: { module: mB, entryPoint: 'fblit', targets: [{ format: f }] }, primitive: { topology: 'triangle-strip' } });
+      for (let m = 1; m < IM; m++) {
+        const q = en.beginRenderPass({ colorAttachments: [{ view: t.createView({ baseMipLevel: m, mipLevelCount: 1 }), loadOp: 'clear', storeOp: 'store' }] });
+        q.setPipeline(pb); q.setBindGroup(0, dev.createBindGroup({ layout: blitL, entries: [{ binding: 0, resource: t.createView({ baseMipLevel: m - 1, mipLevelCount: 1 }) }, { binding: 1, resource: samp }] })); q.draw(4); q.end();
+      }
     }
-    // mouse look through two cascaded low-pass stages
-    const kq = 1 - exp(-dt * 30); lkx += mdx * 0.0022; lky += mdy * 0.0022; mdx = 0; mdy = 0;
-    const ax = lkx * kq, ay = lky * kq; lkx -= ax; lky -= ay; l2x += ax; l2y += ay;
-    const dyw = l2x * kq, dpt = l2y * kq; l2x -= dyw; l2y -= dpt;
-    const yaw = F[YAW] + dyw; let pitch = F[PIT] - dpt; pitch = pitch < -1.55 ? -1.55 : pitch > 1.55 ? 1.55 : pitch;
-    const sp = ks || tN > 1 ? 26 : 7, k = 1 - exp(-dt * 4.5), mf = tId >= 0 ? 0.7 : kf - kb, mr = kr - kl, mu = ku - kd, cp = cos(pitch), sy = sin(yaw), cw = cos(yaw);
-    const vx = F[VX] + ((sy * cp * mf + cw * mr) * sp - F[VX]) * k, vy = F[VY] + ((sin(pitch) * mf + mu) * sp - F[VY]) * k, vz = F[VZ] + ((-cw * cp * mf + sy * mr) * sp - F[VZ]) * k;
-    let x = F[CX] + vx * dt, y = F[CY] + vy * dt, z = F[CZ] + vz * dt;
-    const rad = sqrt(x * x + z * z); if (rad > 150) { x *= 150 / rad; z *= 150 / rad; }
-    y = y < -52 ? -52 : y > -1.2 ? -1.2 : y;
-    F[YAW] = yaw; F[PIT] = pitch; F[VX] = vx; F[VY] = vy; F[VZ] = vz; F[MX] = x - F[CX]; F[MY] = y - F[CY]; F[MZ] = z - F[CZ];
-    collide();
+    dev.queue.submit([en.finish()]);
+    if (DBG) { await dev.queue.onSubmittedWorkDone(); console.log('bake ok'); }
   }
-  render();
-  if (hud) {
-    hN++; if (dtr > hMax) hMax = dtr; if (dtr < hMin) hMin = dtr; if (dtr > hPer * 1.5) { hLate++; hTot++; }
-    F[HUDT] += dtr / 1000;
-    if (F[HUDT] > 0.5) { info.textContent = `${(hN / F[HUDT]).toFixed(0)} fps  ·  worst frame ${hMax.toFixed(1)} ms  ·  late frames ${hLate} (total ${hTot})  ·  GPU ${F[GPU].toFixed(2)} ms  ·  ${W}x${H} (${W * 100 / DW | 0}%)`; F[HUDT] = 0; hPer = hMin; hN = 0; hMax = 0; hMin = 1e9; hLate = 0; }
+
+  // ---------- render targets (recreated on resize) ----------
+  let RW = 0, RH = 0, volG, cmpG;
+  const passSh = [0, 1].map(c => ({ colorAttachments: [], depthStencilAttachment: { view: shadowT.createView({ dimension: '2d', baseArrayLayer: c, arrayLayerCount: 1 }), depthClearValue: 1, depthLoadOp: 'clear', depthStoreOp: 'store' } }));
+  const passMain = { colorAttachments: [{ view: null, resolveTarget: null, loadOp: 'clear', storeOp: 'discard', clearValue: [0, 0, 0, 1] }], depthStencilAttachment: { view: null, depthClearValue: 0, depthLoadOp: 'clear', depthStoreOp: 'store' } };
+  const passVol = { colorAttachments: [{ view: null, loadOp: 'clear', storeOp: 'store' }, { view: null, loadOp: 'clear', storeOp: 'store' }] };
+  const passCmp = { colorAttachments: [{ view: null, loadOp: 'clear', storeOp: 'store' }] }, passCom = {};
+  const FW = +(Q.get('w') || 0), FH = +(Q.get('h') || 0);
+  function resize() {
+    const w = FW || Math.max(16, Math.floor(canvas.clientWidth * devicePixelRatio)), h = FH || Math.max(16, Math.floor(canvas.clientHeight * devicePixelRatio));
+    if (w == RW && h == RH) return;
+    RW = canvas.width = w; RH = canvas.height = h;
+    const col = dev.createTexture({ size: [w, h], format: HDR, sampleCount: MSAA, usage: RA }), dep = dev.createTexture({ size: [w, h], format: DF, sampleCount: MSAA, usage: RA | TB });
+    const res = MSAA > 1 ? dev.createTexture({ size: [w, h], format: HDR, usage: RA | TB }) : col, hw = Math.ceil(w / 2), hh = Math.ceil(h / 2);
+    if (MSAA == 1) { col.destroy(); }
+    const res1 = MSAA > 1 ? res : dev.createTexture({ size: [w, h], format: HDR, usage: RA | TB });
+    const vC = dev.createTexture({ size: [hw, hh], format: HDR, usage: RA | TB }), vZ = dev.createTexture({ size: [hw, hh], format: 'r16float', usage: RA | TB });
+    const dv = dep.createView();
+    passMain.colorAttachments[0].view = MSAA > 1 ? col.createView() : res1.createView(); passMain.colorAttachments[0].resolveTarget = MSAA > 1 ? res.createView() : undefined; passMain.colorAttachments[0].storeOp = MSAA > 1 ? 'discard' : 'store';
+    passMain.depthStencilAttachment.view = dv;
+    passVol.colorAttachments[0].view = vC.createView(); passVol.colorAttachments[1].view = vZ.createView();
+    volG = dev.createBindGroup({ layout: volL, entries: [{ binding: 0, resource: dv }] });
+    if (MANUAL) { offT = dev.createTexture({ size: [w, h], format: fmt, usage: RA | GPUTextureUsage.COPY_SRC }); passCmp.colorAttachments[0].view = offT.createView(); }
+    cmpG = dev.createBindGroup({ layout: cmpL, entries: [{ binding: 0, resource: dv }, { binding: 1, resource: res1.createView() }, { binding: 2, resource: vC.createView() }, { binding: 3, resource: vZ.createView() }] });
   }
+  resize(); addEventListener('resize', resize);
+
+  // ---------- player / camera ----------
+  // CPU mirror of the GPU tree scatter: lets the player bump into trunks and keeps test poses out of them
+  const pcg = v => { const s = Math.imul(v, 747796405) + 2891336453 >>> 0, w = Math.imul((s >>> (s >>> 28) + 4 ^ s) >>> 0, 277803737) >>> 0; return (w >>> 22 ^ w) >>> 0; };
+  const h4 = new Float64Array(4), hash4 = (cx, cz, k) => { let a = pcg((cx >>> 0 ^ pcg((cz >>> 0) + Math.imul(k, 0x9e3779b9) >>> 0)) >>> 0); for (let i = 0; i < 4; i++) { h4[i] = (a >>> 8) / 16777216; a = pcg(a); } };
+  const TR = [2.3, .75, 1.3, .7, .28, 2.1, 1.3, .8, .72, .55, .45, .35], tree = new Float64Array(15);
+  function treeAt(cx, cz) {
+    hash4(cx, cz, 1); const x = (cx + .12 + .76 * h4[0]) * 6, z = (cz + .12 + .76 * h4[1]) * 6, r3 = h4[3], y = H(x, z, 0), ds = W.ds;
+    if (y < 2.5) return false;
+    const sl = Math.hypot(H(x + 4, z, 0) - y, H(x, z + 4, 0) - y) / 4, a = zalt(x, z, y);
+    let c = .84 * (1 - sst(2900, 3250, a) * .92 * (1 - sst(-.06, .16, nd(x / 170 + 2, z / 170 + 9)))) * (1 - sst(3580, 3820, a) * .62) * (1 - sst(.95, 1.6, sl)) * sst(2.5, 7, ds) * sst(1.5, 10, y);
+    if (Math.hypot(x - site[0], z - site[1]) < 14 || Math.hypot(x - site[4], z - site[5]) < 17) c = 0;
+    const qx = x - site[8], qz = z - site[9], qr = Math.hypot(qx, qz); if (Math.abs(qr - site[10]) < 5 && (qx * site[12] + qz * site[13]) / qr > site[14] - .01) c = 0;
+    const bx = x - site[16], bz = z - site[17]; if (Math.abs(bx * site[18] + bz * site[19]) < site[22] + 7 && Math.abs(bz * site[18] - bx * site[19]) < 4.5) c = 0;
+    if (r3 > c) return false;
+    hash4(cx, cz, 2); let tot = 0, kind = 0;
+    for (let k = 0; k < 12; k++) { const t = KT[k]; let w = t[3] * sat((a - t[0]) / t[2] + .5) * sat((t[1] - a) / t[2] + .5); if (k == 2) w *= sst(.02, .25, nd(x / 140 + 7, z / 140 + 1)) * 5; tree[k + 3] = w; tot += w; }
+    if (tot < 1e-3) return false;
+    let pk = h4[0] * tot; for (let k = 0; k < 12; k++) if (tree[k + 3] > 0) { kind = k; if (pk < tree[k + 3]) break; pk -= tree[k + 3]; }
+    let sc = KS[kind][0] + KS[kind][1] * h4[1]; if (kind < 10) sc *= 1 - .42 * sst(3400, 3750, a);
+    tree[0] = x; tree[1] = z; tree[2] = TR[kind] * sc; return true;
+  }
+  // nearest-trunk clearance at a point (negative = inside a trunk)
+  function clearance(x, z) { let m = 1e9; const cx = Math.floor(x / 6), cz = Math.floor(z / 6); for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) if (treeAt(cx + i, cz + j)) m = Math.min(m, Math.hypot(x - tree[0], z - tree[1]) - tree[2]); return m; }
+  const P = { x: 0, y: 0, z: 0, vy: 0, yaw: 0, pitch: 0, gy: 0, air: false, lift: 0 };
+  const rng = mkrng(Q.has('seed') ? +Q.get('seed') : Math.random() * 4294967296);
+  const ground = (x, z, y) => { const h = H(x, z, 0), d = deckY(x, z); return d > h && y > d - 2.2 ? d : h; };
+  const place = (x, z, yaw) => { P.x = x; P.z = z; P.yaw = yaw; P.gy = P.y = Math.max(H(x, z, 0), deckY(x, z)); P.vy = 0; P.pitch = 0; };
+  const look = (x, z, tx, tz) => place(x, z, Math.atan2(tx - x, z - tz));
+  {
+    const nx = site[18], nz = site[19], go = { summit: [site[0] + 4, site[1] + 6, site[0], site[1]], sacred: [site[4] + 18, site[5] + 24, site[4], site[5]], rail: [site[8] + site[12] * site[10], site[9] + site[13] * site[10], site[8] + site[12] * site[10] - site[13] * 30, site[9] + site[13] * site[10] + site[12] * 30], bridge: [site[16] + nx * 32, site[17] + nz * 32, site[16], site[17]] }[Q.get('goto')];
+    if (go) look(...go);
+    else for (; ;) { const x = (rng() - .5) * 24000, z = (rng() - .5) * 45000, h = H(x, z, 0); if (h > 8 && W.ds > 8) { const hx = H(x + 3, z, 0) - h, hz = H(x, z + 3, 0) - h; if (hx * hx + hz * hz < 9 && clearance(x, z) > 1) { place(x, z, rng() * 6.283); break; } } }
+  }
+  // scripted route: a straight climb from the western foothills toward Yushan (bench + critic poses)
+  const route = (() => { let x = site[0] - 400; const z = site[1] - 260; while (H(x, z, 0) > 330 && x > -12000) x -= 20; return { ax: x, az: z, bx: site[0] - 420, bz: z }; })();
+  const poses = [];
+  { // one pose per zone near the route: gentle ground, inside forest, away from streams
+    const tg = [260, 1000, 2060, 2820, 3340, 3800];
+    for (let k = 0; k < 6; k++) {
+      let best = 1e9, bx = 0, bz = 0, by = 0;
+      for (let s = 0; s <= 1; s += .0012) for (let o = -300; o <= 300; o += 60) {
+        const x = route.ax + (route.bx - route.ax) * s, z = route.az + o, h = H(x, z, 0), dsv = W.ds, a = zalt(x, z, h);
+        if (Math.abs(a - tg[k]) > 70 || dsv < 40) continue;
+        const gx = H(x + 6, z, 0) - h, gz = H(x, z + 6, 0) - h, sl = Math.hypot(gx, gz) / 6, m = nd(x / 170 + 2, z / 170 + 9);
+        let sc = sl + (k > 2 && k < 5 && m < .2 ? 2 : 0) + Math.abs(a - tg[k]) / 400;
+        if (k < 5 && sc < best + 1) { let n = 0; const cx = Math.floor(x / 6), cz = Math.floor(z / 6); for (let j = -3; j <= 3; j++) for (let i = -3; i <= 3; i++) if (treeAt(cx + i, cz + j)) n++; sc -= n * .04; }
+        if (sc < best) { best = sc; bx = x; bz = z; by = Math.atan2(-gx, gz); }
+      }
+      { let bc = -1e9, ox = bx, oz = bz; for (let j = -8; j <= 8; j += 1.5) for (let i = -8; i <= 8; i += 1.5) { const c = Math.min(clearance(bx + i, bz + j), 6) - Math.hypot(i, j) * .1; if (c > bc) { bc = c; ox = bx + i; oz = bz + j; } } bx = ox; bz = oz; }
+      { let bs = -1e9, yw = by; const cx = Math.floor(bx / 6), cz = Math.floor(bz / 6), T = [];
+        for (let j = -7; j <= 7; j++) for (let i = -7; i <= 7; i++) if (treeAt(cx + i, cz + j)) T.push(tree[0] - bx, tree[1] - bz, tree[2]);
+        for (let c = 0; c < 16; c++) { const yaw = c * .3927, fx = Math.sin(yaw), fz = -Math.cos(yaw); let sc = 0;
+          for (let i = 0; i < T.length; i += 3) { const d = Math.hypot(T[i], T[i + 1]), cs = (T[i] * fx + T[i + 1] * fz) / d; if (cs > .8 && d > 7 && d < 42) sc += 1; if (cs > .55 && d - T[i + 2] < 4.5) sc -= 50; }
+          const dh = H(bx + fx * 25, bz + fz * 25, 0) - H(bx, bz, 0); sc -= dh > 0 ? dh * 1.2 : -dh * .15;
+          if (sc > bs) { bs = sc; yw = yaw; } }
+        by = yw; }
+      poses.push([bx, bz, by, [.12, .14, .16, .24, .24, .0][k]]);
+    }
+    { // alpine: a ridge shoulder with the ground falling away in front (ridgelines + sea of clouds)
+      let bs = -1e9;
+      for (let j = -500; j <= 500; j += 50) for (let i = -500; i <= 500; i += 50) {
+        const x = site[0] + i, z = site[1] + j, h = H(x, z, 0); if (h < 3680 || h > 3900) continue;
+        for (let c = 0; c < 12; c++) { const yaw = c * .5236, fx = Math.sin(yaw), fz = -Math.cos(yaw), d1 = h - H(x + fx * 60, z + fz * 60, 0), d2 = h - H(x + fx * 400, z + fz * 400, 0);
+          const sc = Math.min(d2, 260) - Math.abs(d1 - 14) * 4; if (sc > bs && clearance(x, z) > 2) { bs = sc; poses[5] = [x, z, yaw, -.06]; } }
+      }
+    }
+  }
+  const keys = {}; let locked = false;
+  addEventListener('keydown', ev => { keys[ev.code] = 1; if (ev.code == 'Space') ev.preventDefault(); });
+  addEventListener('keyup', ev => { keys[ev.code] = 0; });
+  canvas.addEventListener('click', () => canvas.requestPointerLock());
+  $('s').addEventListener('click', () => canvas.requestPointerLock());
+  document.addEventListener('pointerlockchange', () => { locked = document.pointerLockElement == canvas; $('s').style.display = locked || BENCH ? 'none' : 'flex'; });
+  addEventListener('mousemove', ev => { if (locked) { P.yaw += ev.movementX * .0022; P.pitch = Math.max(-1.45, Math.min(1.45, P.pitch - ev.movementY * .0022)); } });
+  if (BENCH || MANUAL) $('s').style.display = 'none';
+
+  // HUD strings are prebuilt so the frame loop never allocates
+  const ALT = []; for (let i = 0; i < 4001; i++) ALT.push(i.toLocaleString('en-US') + ' m');
+  const hudA = $('a').firstChild, hudZ = $('z').firstChild; let lastA = -1, lastZ = -1;
+
+  // ---------- per-frame state (all preallocated) ----------
+  let time = 0, cov = .5, beltW = .12, frameNo = 0, simT = 0;
+  const sun = [.52, .62, .58]; { const l = Math.hypot(...sun); sun[0] /= l; sun[1] /= l; sun[2] /= l; }
+  const lx = [0, 0, 0], ly = [0, 0, 0]; { const l = Math.hypot(sun[2], sun[0]); lx[0] = sun[2] / l; lx[2] = -sun[0] / l; ly[0] = sun[1] * lx[2]; ly[1] = sun[2] * lx[0] - sun[0] * lx[2]; ly[2] = -sun[1] * lx[0]; }
+  const SR = [22, 78], SD = 400, subs = [null];
+  const qs = hasTS ? dev.createQuerySet({ type: 'timestamp', count: 2 }) : null, qR = hasTS ? dev.createBuffer({ size: 16, usage: BU.QUERY_RESOLVE | BU.COPY_SRC }) : null;
+  const qM = [], qFree = []; if (hasTS) for (let i = 0; i < 6; i++) { qM.push(dev.createBuffer({ size: 16, usage: BU.MAP_READ | BU.COPY_DST })); qFree.push(i); }
+  const BN = 60 * 720, bGpu = new Float32Array(BN), bCpu = new Float32Array(BN); let bg = 0, bc = 0, lastGpu = 0, benchT = -1, benchDone = false;
+  if (hasTS) { passCom.timestampWrites = { querySet: qs, beginningOfPassWriteIndex: 0 }; passCmp.timestampWrites = { querySet: qs, endOfPassWriteIndex: 1 }; }
+  const onMap = qM.map((b, i) => () => { const a = new BigInt64Array(b.getMappedRange()); lastGpu = Number(a[1] - a[0]) / 1e6; b.unmap(); qFree.push(i); if (benchT >= 0 && !benchDone && bg < BN && lastGpu > 0) bGpu[bg++] = lastGpu; });
+
+  function push() { const cx = Math.floor(P.x / 6), cz = Math.floor(P.z / 6); for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) if (treeAt(cx + i, cz + j)) { const ex = P.x - tree[0], ez = P.z - tree[1], l = Math.hypot(ex, ez), m = tree[2] * .8 + .3; if (l < m && l > 1e-3) { P.x = tree[0] + ex / l * m; P.z = tree[1] + ez / l * m; } } }
+  function update(dt) {
+    time += dt;
+    if (benchT >= 0) {
+      const s = Math.min(benchT / 60, 1), x = route.ax + (route.bx - route.ax) * s, z = route.az + 40 * Math.sin(s * 40);
+      P.x = x; P.z = z; push();
+      P.gy = H(P.x, P.z, 0); P.y += (P.gy - P.y) * Math.min(1, dt * 5); if (P.y < P.gy) P.y = P.gy;
+      P.yaw = 2.7 + .8 * Math.sin(benchT * .35); P.pitch = .16 + .08 * Math.sin(benchT * .23);
+    } else if (!MANUAL) {
+      const sp = (keys.ShiftLeft || keys.ShiftRight ? 18 : 6) * dt, f = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0), r = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0), l = Math.hypot(f, r) || 1;
+      const s = Math.sin(P.yaw), c = Math.cos(P.yaw), dx = (s * f + c * r) / l * sp, dz = (-c * f + s * r) / l * sp;
+      if (H(P.x + dx, P.z + dz, 0) > .45) { P.x += dx; P.z += dz; } else if (H(P.x + dx, P.z, 0) > .45) P.x += dx; else if (H(P.x, P.z + dz, 0) > .45) P.z += dz;
+      push();
+      const g = ground(P.x, P.z, P.y);
+      if (P.air) { P.vy -= 16 * dt; P.y += P.vy * dt; if (P.y <= g) { P.y = g; P.air = false; } }
+      else { P.y += (g - P.y) * Math.min(1, dt * 14); if (keys.Space) { P.vy = 5.6; P.air = true; } }
+      P.gy = g;
+    }
+    // slow-moving atmosphere parameters
+    const h = P.gy, a = zalt(P.x, P.z, h);
+    let c = .84 * (1 - sst(3580, 3820, a) * .62) * (1 - sst(2900, 3250, a) * .92 * (1 - sst(-.06, .16, nd(P.x / 170 + 2, P.z / 170 + 9)))) * sst(1.5, 10, h);
+    const k = Math.min(1, dt * 1.5); cov += (c - cov) * k;
+    beltW += (.1 + .9 * (sat((P.y - 1500) / 200) - sat((P.y - 2300) / 250)) - beltW) * k;
+    const al = Math.max(0, Math.min(4000, Math.round(P.gy))); if (al != lastA) { lastA = al; hudA.data = ALT[al]; }
+    const zn = zoneOf(P.gy); if (zn != lastZ) { lastZ = zn; hudZ.data = ZONES[zn]; }
+  }
+
+  const pl = (i, ax, ay, az, d) => { const l = Math.hypot(ax, ay, az); G[76 + i * 4] = ax / l; G[77 + i * 4] = ay / l; G[78 + i * 4] = az / l; G[79 + i * 4] = d / l; };
+  function uniforms() {
+    const cx = P.x, cy = P.y + 1.7 + P.lift, cz = P.z, sy = Math.sin(P.yaw), cyw = Math.cos(P.yaw), sp = Math.sin(P.pitch), cp = Math.cos(P.pitch);
+    const fx = sy * cp, fy = sp, fz = -cyw * cp, rx = cyw, rz = sy, ux = -sy * sp, uy = cp, uz = cyw * sp;
+    const ty = 1 / Math.tan(.5 * 1.047), tx = ty * RH / RW;
+    G[0] = tx * rx; G[4] = 0; G[8] = tx * rz; G[12] = 0; G[1] = ty * ux; G[5] = ty * uy; G[9] = ty * uz; G[13] = 0; G[2] = 0; G[6] = 0; G[10] = 0; G[14] = NEAR; G[3] = fx; G[7] = fy; G[11] = fz; G[15] = 0;
+    G[16] = rx / tx; G[17] = 0; G[18] = rz / tx; G[19] = 0; G[20] = ux / ty; G[21] = uy / ty; G[22] = uz / ty; G[23] = 0; G[24] = 0; G[25] = 0; G[26] = 0; G[27] = 1 / NEAR; G[28] = fx; G[29] = fy; G[30] = fz; G[31] = 0;
+    for (let c = 0; c < 2; c++) {
+      const R = SR[c], d = R * .7; let px = fx * d, py = fy * d, pz = fz * d;
+      const tex = 2 * R / 2048, wx = lx[0] * (cx + px) + lx[2] * (cz + pz), wy = ly[0] * (cx + px) + ly[1] * (cy + py) + ly[2] * (cz + pz);
+      const ox = Math.round(wx / tex) * tex - wx, oy = Math.round(wy / tex) * tex - wy;
+      px += lx[0] * ox + ly[0] * oy; py += ly[1] * oy; pz += lx[2] * ox + ly[2] * oy;
+      const o = 32 + c * 16;
+      G[o] = lx[0] / R; G[o + 4] = 0; G[o + 8] = lx[2] / R; G[o + 12] = -(lx[0] * px + lx[2] * pz) / R;
+      G[o + 1] = ly[0] / R; G[o + 5] = ly[1] / R; G[o + 9] = ly[2] / R; G[o + 13] = -(ly[0] * px + ly[1] * py + ly[2] * pz) / R;
+      G[o + 2] = -sun[0] / (2 * SD); G[o + 6] = -sun[1] / (2 * SD); G[o + 10] = -sun[2] / (2 * SD); G[o + 14] = .5 + (sun[0] * px + sun[1] * py + sun[2] * pz) / (2 * SD);
+      G[o + 3] = 0; G[o + 7] = 0; G[o + 11] = 0; G[o + 15] = 1;
+      G[96 + c * 4] = px; G[97 + c * 4] = py; G[98 + c * 4] = pz; G[99 + c * 4] = R;
+    }
+    G[64] = cx; G[65] = cy; G[66] = cz; G[67] = time;
+    G[68] = sun[0]; G[69] = sun[1]; G[70] = sun[2]; G[71] = Q.has('zoo') ? 1 : 0;
+    G[72] = RW; G[73] = RH; G[74] = 1 / RW; G[75] = 1 / RH;
+    pl(0, fx + tx * rx, fy, fz + tx * rz, 0); pl(1, fx - tx * rx, fy, fz - tx * rz, 0); pl(2, fx + ty * ux, fy + ty * uy, fz + ty * uz, 0); pl(3, fx - ty * ux, fy - ty * uy, fz - ty * uz, 0); pl(4, fx, fy, fz, -NEAR);
+    G[104] = .8; G[105] = .6; G[106] = 1;
+    G[108] = W.S; G[109] = (.23 + .47 * cov) * (1 - .2 * beltW); G[110] = (1 - sst(450, 1100, P.gy)) * cov; G[111] = beltW;
+    G[112] = (1 - sst(1500, 2700, P.gy)) * .9; G[113] = 1; G[114] = 1 - .85 * cov; G[115] = ty;
+    G.set(site, 116);
+    for (let l = 0; l < NLV; l++) { const s = .5 * (1 << l), o = 148 + l * 4; G[o] = Math.round(cx / (2 * s)) * 2 * s - cx; G[o + 1] = Math.round(cz / (2 * s)) * 2 * s - cz; G[o + 2] = s; }
+    for (let k = 0; k < NP; k++) { propI[k * 8] = propA[k][0] - cx; propI[k * 8 + 1] = propA[k][1] - cy; propI[k * 8 + 2] = propA[k][2] - cz; }
+  }
+
+  function render() {
+    resize(); uniforms(); frameNo++;
+    dev.queue.writeBuffer(gB, 0, G); dev.queue.writeBuffer(drawB, 0, drawT); dev.queue.writeBuffer(propB, 0, propI);
+    const en = dev.createCommandEncoder();
+    let p = en.beginComputePass(passCom);
+    p.setBindGroup(0, compG);
+    if (!(DBG & 1)) {
+    p.setPipeline(pCom[0]); p.dispatchWorkgroups(TG / 8, TG / 8);
+    p.setPipeline(pCom[1]); p.dispatchWorkgroups(UG / 8, UG / 8);
+    p.setPipeline(pCom[2]); p.dispatchWorkgroups(GG / 8, GG / 8);
+    p.setPipeline(pCom[3]); p.dispatchWorkgroups(2, 2, 5);
+    }
+    p.end();
+    for (let c = 0; c < 2; c++) {
+      if (DBG & 2) break;
+      p = en.beginRenderPass(passSh[c]);
+      p.setPipeline(pSh[c]); p.setBindGroup(0, liteG); p.setVertexBuffer(0, meshVB); p.setIndexBuffer(meshIB, 'uint32');
+      for (let k = 0; k < NK; k++) if (CAST(k)) { const l = k * 3 + 1 + c; p.setVertexBuffer(1, instB, LB[l] * 32); p.drawIndexedIndirect(drawB, l * 20); }
+      for (let k = 0; k < NP; k++) { const m = ms.info[NK + k]; p.setVertexBuffer(1, propB, k * 32); p.drawIndexed(m.count, 1, m.first, m.base); }
+      p.end();
+    }
+    p = en.beginRenderPass(passMain);
+    p.setBindGroup(0, sceneG);
+    if (!(DBG & 4)) {
+    p.setPipeline(pVeg); p.setVertexBuffer(0, meshVB); p.setIndexBuffer(meshIB, 'uint32');
+    for (let k = 0; k < NK; k++) { p.setVertexBuffer(1, instB, LB[k * 3] * 32); p.drawIndexedIndirect(drawB, k * 60); }
+    for (let k = 0; k < NP; k++) { const m = ms.info[NK + k]; p.setVertexBuffer(1, propB, k * 32); p.drawIndexed(m.count, 1, m.first, m.base); }
+    }
+    if (!(DBG & 8)) {
+    p.setPipeline(pTer); p.setVertexBuffer(0, terVB); p.setIndexBuffer(terIB, 'uint32'); p.drawIndexed(terN);
+    }
+    if (!(DBG & 16)) { p.setPipeline(pImp); p.setVertexBuffer(0, instB, LB[NK * 3] * 32); p.drawIndirect(drawB, NK * 60); }
+    if (!(DBG & 32)) { p.setPipeline(pSky); p.draw(4); }
+    if (!(DBG & 64)) { p.setPipeline(pPar); p.draw(4, NPOL + NFLY); }
+    p.end();
+    p = en.beginRenderPass(passVol); p.setPipeline(pVol); p.setBindGroup(0, sceneG); p.setBindGroup(1, volG); if (!(DBG & 128)) p.draw(4); p.end();
+    if (!MANUAL) passCmp.colorAttachments[0].view = ctx.getCurrentTexture().createView();
+    p = en.beginRenderPass(passCmp); p.setPipeline(pCmp); p.setBindGroup(0, sceneG); p.setBindGroup(1, cmpG); p.draw(4); p.end();
+    let qi = -1;
+    if (hasTS) { en.resolveQuerySet(qs, 0, 2, qR, 0); if (qFree.length) { qi = qFree.pop(); en.copyBufferToBuffer(qR, 0, qM[qi], 0, 16); } }
+    subs[0] = en.finish(); dev.queue.submit(subs);
+    if (qi >= 0) qM[qi].mapAsync(GPUMapMode.READ).then(onMap[qi]);
+  }
+
+  let last = 0;
+  function frame(now) {
+    const dt = Math.min(.1, (now - last) / 1000) || 1 / 60;
+    if (benchT >= 0 && !benchDone) { if (last && bc < BN) bCpu[bc++] = now - last; benchT += dt; if (benchT >= 60) finishBench(); }
+    last = now; update(dt); render();
+    requestAnimationFrame(frame);
+  }
+  function stats(a, n) { const s = Array.from(a.subarray(0, n)).sort((x, y) => x - y); let m = 0; for (const v of s) m += v; return { n, avg: +(m / n).toFixed(3), p99: +s[Math.floor(n * .99)].toFixed(3), max: +s[n - 1].toFixed(3) }; }
+  function finishBench() {
+    benchDone = true;
+    const r = { seed: Q.get('seed') || 'random', resolution: RW + 'x' + RH, msaa: MSAA, gpu: adapter.info ? (adapter.info.vendor + ' ' + adapter.info.architecture + ' ' + adapter.info.description).trim() : '', altitude: [Math.round(H(route.ax, route.az, 0)), Math.round(P.gy)], gpuMs: bg ? stats(bGpu, bg) : 'timestamp-query unavailable', frameMs: stats(bCpu, bc) };
+    window.__bench = r; console.log('BENCH ' + JSON.stringify(r));
+    msg.textContent = 'Walk-through complete\n' + JSON.stringify(r, null, 1); msg.style.display = 'block';
+  }
+  // test hooks (manual stepping for headless capture)
+  window.__t = {
+    poses, route, site, P, info: ms.info,
+    pose(i) { const q = poses[i]; place(q[0], q[1], q[2]); P.pitch = q[3]; cov = 1; update(0); update(0); },
+    set(x, z, yaw, pitch) { place(x, z, yaw); P.pitch = pitch; },
+    look(x, z, tx, tz, pitch, lift) { look(x, z, tx, tz); P.pitch = pitch || 0; P.lift = lift || 0; },
+    step(dt) { update(dt); render(); return dev.queue.onSubmittedWorkDone(); },
+    path(s, dt) { benchT = s * 60; for (let k = 0; k < 12; k++) update(dt); benchT = -1; render(); return dev.queue.onSubmittedWorkDone(); },
+    gpu: () => lastGpu, H, zalt, clearance,
+    async inst(l, n) { const b = dev.createBuffer({ size: n * 32, usage: BU.COPY_DST | BU.MAP_READ }), en = dev.createCommandEncoder(); en.copyBufferToBuffer(instB, LB[l] * 32, b, 0, n * 32); dev.queue.submit([en.finish()]); await b.mapAsync(GPUMapMode.READ); const a = Array.from(new Float32Array(b.getMappedRange())).map(x => +x.toFixed(2)).join(','); b.unmap(); return a; },
+    async counts() { const b = dev.createBuffer({ size: drawT.byteLength, usage: BU.COPY_DST | BU.MAP_READ }), en = dev.createCommandEncoder(); en.copyBufferToBuffer(drawB, 0, b, 0, drawT.byteLength); dev.queue.submit([en.finish()]); await b.mapAsync(GPUMapMode.READ); const a = new Uint32Array(b.getMappedRange()), o = []; for (let l = 0; l < NL; l++) o.push(a[l * 5 + 1]); b.unmap(); return o.join(','); },
+    async png() {
+      const bpr = RW * 4 + 255 & ~255, b = dev.createBuffer({ size: bpr * RH, usage: BU.COPY_DST | BU.MAP_READ }), en = dev.createCommandEncoder();
+      en.copyTextureToBuffer({ texture: offT }, { buffer: b, bytesPerRow: bpr }, [RW, RH]); dev.queue.submit([en.finish()]);
+      await b.mapAsync(GPUMapMode.READ); const src = new Uint8Array(b.getMappedRange()), cv = document.createElement('canvas'); cv.width = RW; cv.height = RH;
+      const c2 = cv.getContext('2d'), im = c2.createImageData(RW, RH), bgr = fmt == 'bgra8unorm';
+      for (let y = 0; y < RH; y++) for (let x = 0; x < RW; x++) { const i = y * bpr + x * 4, o = (y * RW + x) * 4; im.data[o] = src[i + (bgr ? 2 : 0)]; im.data[o + 1] = src[i + 1]; im.data[o + 2] = src[i + (bgr ? 0 : 2)]; im.data[o + 3] = 255; }
+      c2.putImageData(im, 0, 0); b.unmap(); b.destroy(); return cv.toDataURL('image/png');
+    },
+  };
+  if (Q.has('shot')) window.__t.pose(+Q.get('shot'));
+  if (BENCH) { benchT = 0; P.y = H(route.ax, route.az, 0); }
+  $('l').style.display = 'none';
+  if (!MANUAL) requestAnimationFrame(frame); else { update(0); render(); if (DBG) { await dev.queue.onSubmittedWorkDone(); console.log('frame ok'); } }
+  window.__ready = true;
 }
-
-// ---------------------------------------------------------------- input
-const key = (e, v) => {
-  switch (e.code) {
-    case 'KeyW': kf = v; break; case 'KeyS': kb = v; break; case 'KeyA': kl = v; break; case 'KeyD': kr = v; break;
-    case 'KeyE': ku = v; break; case 'KeyQ': kd = v; break; case 'ShiftLeft': case 'ShiftRight': ks = v; break;
-    default: if (v && !e.repeat) {
-      if (e.code === 'KeyH') { hud = !hud; hTot = 0; hPer = 1e9; info.textContent = ''; }
-      else if (e.code === 'KeyM') mute();
-      else if (e.code === 'Escape') ui(true);
-      else if (e.code >= 'Digit1' && e.code <= 'Digit6') lookAt(...POSES[e.code.charCodeAt(5) - 49]);
-    }
-  }
-};
-// behind the menu only the stats and mute keys work
-addEventListener('keydown', (e) => { if (menu && e.code !== 'KeyH' && e.code !== 'KeyM') return; sound(); key(e, 1); });
-addEventListener('keyup', (e) => key(e, 0));
-const release = () => { kf = kb = kl = kr = ku = kd = ks = 0; tId = -1; tN = 0; };
-const capture = () => { sound(); const p = canvas.requestPointerLock({ unadjustedMovement: true }); if (p && p.catch) p.catch(() => canvas.requestPointerLock()).catch(() => 0); };
-canvas.addEventListener('click', capture);
-addEventListener('mousemove', (e) => { if (document.pointerLockElement === canvas) { mdx += e.movementX; mdy += e.movementY; } });
-addEventListener('blur', release);
-const touch = (e) => {
-  e.preventDefault(); sound(); tN = e.touches.length;
-  let f = null, first = false; for (let i = 0; i < tN; i++) if (e.touches[i].identifier === tId) f = e.touches[i];
-  if (!f) { tId = -1; if (tN) { f = e.touches[0]; tId = f.identifier; first = true; } }
-  if (f) {
-    // the touch axes turn with the page when it lies on its side
-    const x = rot.matches ? f.clientY : f.clientX, y = rot.matches ? -f.clientX : f.clientY, s = 1100 / min(innerWidth, innerHeight);
-    if (first) { tx0 = x; ty0 = y; } else { mdx += (x - tx) * s; mdy += (y - ty) * s; } // the view follows the finger at once
-    tx = x; ty = y;
-  }
-};
-for (const n of ['touchstart', 'touchmove', 'touchend', 'touchcancel']) canvas.addEventListener(n, touch, { passive: false });
-
-// ---------------------------------------------------------------- menu
-// The scene keeps rendering (blurred by CSS) behind the menu. Esc, losing the mouse or the corner button open it.
-let menu = true;
-const bDive = $('d');
-const ui = (m) => {
-  if (dead) return;
-  menu = m; body.className = m ? 'm' : document.pointerLockElement ? 'g p' : 'g';
-  // focus the dive button so Enter works (delayed: it can't take focus while still hidden)
-  if (m) { release(); setTimeout(() => menu && bDive.focus(), 100); } else document.activeElement.blur();
-};
-const go = () => {
-  sound(); ui(false); bDive.textContent = 'Resume';
-  // phones: go fullscreen and ask for landscape; where that is refused the CSS rotation still applies
-  if (mob) document.documentElement.requestFullscreen?.()?.then(() => screen.orientation.lock('landscape')).catch(() => 0);
-  if (!mob) capture();
-};
-bDive.onclick = go; $('o').onclick = () => ui(true);
-// detail buttons: the current level is lit, the others reload the page with theirs
-$('q').querySelectorAll('button').forEach((b, i) => { if (i === 2 - LV) b.className = 'on'; else b.onclick = () => { keep('abyssal', 2 - i); location.reload(); }; });
-document.addEventListener('pointerlockchange', () => ui(!document.pointerLockElement));
-
-// draw the first frame and wait for the GPU to finish it (pipelines get compiled on first use) before the reveal
-lookAt(...POSES[0]);
-await say('Letting the light in…', 1, 400);
-render(); await Q.onSubmittedWorkDone();
-setTimeout(keep, 15e3, 'abyssalLoad', ''); // the load counts as survived after 15 s of frames
-ui(true);
-requestAnimationFrame((t) => { F[LAST] = t; requestAnimationFrame(frame); });
+main().catch(e => { console.error(e); fail(String(e)); });
