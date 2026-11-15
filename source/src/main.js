@@ -52,7 +52,7 @@ async function main() {
   drawT[NK * 15] = 4;
   const drawB = dev.createBuffer({ size: drawT.byteLength, usage: BU.STORAGE | BU.INDIRECT | BU.COPY_DST | BU.COPY_SRC });
   // tree zone table: lo, hi, fade, weight
-  const KT = [[0, 520, 160, .22], [0, 850, 260, 1], [0, 720, 200, .22], [450, 2350, 300, 1], [350, 1800, 250, .75], [1550, 2600, 200, .8], [1650, 2600, 200, .7], [2450, 3150, 180, 1], [2500, 3150, 180, .6], [3050, 3660, 150, 1.3], [3050, 3700, 150, .14], [3520, 4100, 120, 1]];
+  const KT = [[0, 520, 160, .22], [0, 850, 260, 1], [0, 720, 200, .22], [450, 2350, 300, 1], [350, 1800, 250, .75], [1550, 2480, 180, .8], [1650, 2480, 180, .7], [2400, 3150, 180, 1], [2450, 3150, 180, .6], [3050, 3660, 150, 1.3], [3050, 3700, 150, .14], [3520, 4100, 120, 1]];
   const KS = ms.info.slice(0, NK).map((m, k) => k < 12 ? [.8, .45, m.ht, 0] : k == 14 ? [.45, .4, 3, 0] : k < 17 ? [.6, .55, Math.max(m.ht, m.hw), 0] : [1, 0, 1, 0]);
   const propI = new Float32Array(NP * 8), propB = dev.createBuffer({ size: propI.byteLength, usage: BU.VERTEX | BU.COPY_DST });
   const propA = [[site[4], site[6], site[5]], [site[16], site[20], site[17]], [site[8], site[11], site[9]], [site[0], site[2], site[1]]];
@@ -210,7 +210,7 @@ async function main() {
           const dh = H(bx + fx * 25, bz + fz * 25, 0) - H(bx, bz, 0); sc -= dh > 0 ? dh * 1.2 : -dh * .15;
           if (sc > bs) { bs = sc; yw = yaw; } }
         by = yw; }
-      poses.push([bx, bz, by, [.12, .14, .16, .24, .24, .0][k]]);
+      poses.push([bx, bz, by, [.12, .14, .16, .1, .2, .0][k]]);
     }
     { // alpine: a ridge shoulder with the ground falling away in front (ridgelines + sea of clouds)
       let bs = -1e9;
@@ -245,19 +245,21 @@ async function main() {
   if (hasTS) { passCom.timestampWrites = { querySet: qs, beginningOfPassWriteIndex: 0 }; passCmp.timestampWrites = { querySet: qs, endOfPassWriteIndex: 1 }; }
   const onMap = qM.map((b, i) => () => { const a = new BigInt64Array(b.getMappedRange()); lastGpu = Number(a[1] - a[0]) / 1e6; b.unmap(); qFree.push(i); if (benchT >= 0 && !benchDone && bg < BN && lastGpu > 0) bGpu[bg++] = lastGpu; });
 
-  function push() { const cx = Math.floor(P.x / 6), cz = Math.floor(P.z / 6); for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) if (treeAt(cx + i, cz + j)) { const ex = P.x - tree[0], ez = P.z - tree[1], l = Math.hypot(ex, ez), m = tree[2] * .8 + .3; if (l < m && l > 1e-3) { P.x = tree[0] + ex / l * m; P.z = tree[1] + ez / l * m; } } }
+  let byaw = 0;
+  function push(ka, kb) { const cx = Math.floor(P.x / 6), cz = Math.floor(P.z / 6); for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) if (treeAt(cx + i, cz + j)) { const ex = P.x - tree[0], ez = P.z - tree[1], l = Math.hypot(ex, ez), m = tree[2] * ka + kb; if (l < m && l > 1e-3) { P.x = tree[0] + ex / l * m; P.z = tree[1] + ez / l * m; } } }
   function update(dt) {
     time += dt;
     if (benchT >= 0) {
       const s = Math.min(benchT / 60, 1), x = route.ax + (route.bx - route.ax) * s, z = route.az + 40 * Math.sin(s * 40);
-      P.x = x; P.z = z; push();
+      P.x = x; P.z = z; push(1.5, 1.2);
       P.gy = H(P.x, P.z, 0); P.y += (P.gy - P.y) * Math.min(1, dt * 5); if (P.y < P.gy) P.y = P.gy;
-      P.yaw = 2.7 + .8 * Math.sin(benchT * .35); P.pitch = .16 + .08 * Math.sin(benchT * .23);
+      { const gx = H(P.x + 8, P.z, 0) - P.gy, gz = H(P.x, P.z + 8, 0) - P.gy, ty = Math.atan2(-gx, gz) + .9 * Math.sin(benchT * .35); let dy = ty - byaw; dy -= Math.round(dy / 6.2832) * 6.2832; byaw += dy * Math.min(1, dt * 1.5); P.yaw = byaw; }
+      P.pitch = .02 + .08 * Math.sin(benchT * .23);
     } else if (!MANUAL) {
       const sp = (keys.ShiftLeft || keys.ShiftRight ? 18 : 6) * dt, f = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0), r = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0), l = Math.hypot(f, r) || 1;
       const s = Math.sin(P.yaw), c = Math.cos(P.yaw), dx = (s * f + c * r) / l * sp, dz = (-c * f + s * r) / l * sp;
       if (H(P.x + dx, P.z + dz, 0) > .45) { P.x += dx; P.z += dz; } else if (H(P.x + dx, P.z, 0) > .45) P.x += dx; else if (H(P.x, P.z + dz, 0) > .45) P.z += dz;
-      push();
+      push(.8, .3);
       const g = ground(P.x, P.z, P.y);
       if (P.air) { P.vy -= 16 * dt; P.y += P.vy * dt; if (P.y <= g) { P.y = g; P.air = false; } }
       else { P.y += (g - P.y) * Math.min(1, dt * 14); if (keys.Space) { P.vy = 5.6; P.air = true; } }
@@ -267,7 +269,7 @@ async function main() {
     const h = P.gy, a = zalt(P.x, P.z, h);
     let c = .84 * (1 - sst(3580, 3820, a) * .62) * (1 - sst(2900, 3250, a) * .92 * (1 - sst(-.06, .16, nd(P.x / 170 + 2, P.z / 170 + 9)))) * sst(1.5, 10, h);
     const k = Math.min(1, dt * 1.5); cov += (c - cov) * k;
-    beltW += (.1 + .9 * (sat((P.y - 1500) / 200) - sat((P.y - 2300) / 250)) - beltW) * k;
+    beltW += (.1 + .9 * (sat((P.y - 1450) / 250) - sat((P.y - 2300) / 300)) - beltW) * k;
     const al = Math.max(0, Math.min(4000, Math.round(P.gy))); if (al != lastA) { lastA = al; hudA.data = ALT[al]; }
     const zn = zoneOf(P.gy); if (zn != lastZ) { lastZ = zn; hudZ.data = ZONES[zn]; }
   }

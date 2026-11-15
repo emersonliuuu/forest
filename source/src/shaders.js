@@ -72,7 +72,7 @@ override CASC:u32=0u;
 const SUNC=vec3f(6.4,5.7,4.6);const HH=900.;const RH=6e-4;const RB=7.5e-3;
 fn tm(c:vec3f)->vec3f{return c/(1.+max(c.r,max(c.g,c.b)));}
 fn amb(n:vec3f)->vec3f{return mix(vec3f(.22,.21,.15),vec3f(.6,.72,.9),n.y*.5+.5);}
-fn ambc(n:vec3f,op:f32)->vec3f{return mix(vec3f(.5,.58,.3)*(.55+.45*(n.y*.5+.5)),amb(n),op);}
+fn ambc(n:vec3f,op:f32)->vec3f{return mix(vec3f(.62,.7,.4)*(.6+.4*(n.y*.5+.5)),amb(n),op);}
 fn skyc(d:vec3f)->vec3f{let mu=max(d.y,0.);let sd=max(dot(d,g.sun.xyz),0.);
 var c=mix(vec3f(.6,.78,1.),vec3f(.1,.27,.75),pow(mu,.5))*1.2;
 c+=vec3f(1.,.85,.6)*(pow(sd,12.)*.3+pow(sd,90.)*.7);
@@ -259,10 +259,10 @@ let t=textureSample(impC,samp,i.uv);let nm=textureSample(impN,samp,i.uv);
 let al=sat((t.a-.38)/max(fwidth(t.a),.04)+.5)*i.fd.x;if(al<.02){discard;}
 let nl=nm.xyz*2.-1.;let fw=normalize(vec3f(-i.rel.x,0.,-i.rel.z));
 let n=normalize(i.rt*nl.x+vec3f(0.,1.,0.)*nl.y+fw*nl.z);let V=normalize(-i.rel);let L=g.sun.xyz;let ndl=dot(n,L);
-let s2=shadow(i.rel,n);let dp=mix(.3,1.,smoothstep(.05,.6,i.fd.y));let sh=mix(dp,s2.x,s2.y);
+let s2=shadow(i.rel,n);let dp=mix(.3,1.,smoothstep(.05,.6,i.fd.y));let sh=mix(dp*.6,s2.x,s2.y);
 let dif=sat(ndl*.6+.4);let tr=pow(sat(dot(-V,L)),3.)*.35+sat(-ndl)*.25;let ao=nm.a;
 let alt=i.rel.y+g.cam.y;let ms=smoothstep(1300.,1750.,alt)*(1.-smoothstep(2550.,3000.,alt));
-var a=t.rgb*mix(vec3f(1.),vec3f(.85,1.05,.8),ms*.5);
+var a=t.rgb*.8*mix(vec3f(1.),vec3f(.85,1.05,.8),ms*.5);
 var col=a*(SUNC*sh*(dif*(.3+.7*ao)+tr*ao*vec3f(.7,.9,.25))+ambc(n,mix(.35,1.,dp))*ao*mix(.6,1.,dp));
 return vec4f(tm(fog(col,i.rel)),al);}
 
