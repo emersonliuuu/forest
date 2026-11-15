@@ -16,7 +16,8 @@ async function main() {
   const ctx = canvas.getContext('webgpu'), fmt = navigator.gpu.getPreferredCanvasFormat();
   dev.lost.then(i => console.error('device lost', i.message));
   const DBG = +(Q.get('dbg') || 0), BENCH = Q.has('bench'), MANUAL = Q.has('manual'), MSAA = +(Q.get('msaa') || 4);
-  if (!MANUAL) ctx.configure({ device: dev, format: fmt, alphaMode: 'opaque' });
+  const OFF = MANUAL || Q.has('offscreen'); // render to a texture instead of the canvas (headless capture / headless bench)
+  if (!OFF) ctx.configure({ device: dev, format: fmt, alphaMode: 'opaque' });
   let offT = null; // headless capture target (manual mode renders offscreen and reads pixels back)
 
   // ---------- world + CPU-generated assets ----------
@@ -149,7 +150,7 @@ async function main() {
     passMain.depthStencilAttachment.view = dv;
     passVol.colorAttachments[0].view = vC.createView(); passVol.colorAttachments[1].view = vZ.createView();
     volG = dev.createBindGroup({ layout: volL, entries: [{ binding: 0, resource: dv }] });
-    if (MANUAL) { offT = dev.createTexture({ size: [w, h], format: fmt, usage: RA | GPUTextureUsage.COPY_SRC }); passCmp.colorAttachments[0].view = offT.createView(); }
+    if (OFF) { offT = dev.createTexture({ size: [w, h], format: fmt, usage: RA | GPUTextureUsage.COPY_SRC }); passCmp.colorAttachments[0].view = offT.createView(); }
     cmpG = dev.createBindGroup({ layout: cmpL, entries: [{ binding: 0, resource: dv }, { binding: 1, resource: res1.createView() }, { binding: 2, resource: vC.createView() }, { binding: 3, resource: vZ.createView() }] });
   }
   resize(); addEventListener('resize', resize);
@@ -341,7 +342,7 @@ async function main() {
     if (!(DBG & 64)) { p.setPipeline(pPar); p.draw(4, NPOL + NFLY); }
     p.end();
     p = en.beginRenderPass(passVol); p.setPipeline(pVol); p.setBindGroup(0, sceneG); p.setBindGroup(1, volG); if (!(DBG & 128)) p.draw(4); p.end();
-    if (!MANUAL) passCmp.colorAttachments[0].view = ctx.getCurrentTexture().createView();
+    if (!OFF) passCmp.colorAttachments[0].view = ctx.getCurrentTexture().createView();
     p = en.beginRenderPass(passCmp); p.setPipeline(pCmp); p.setBindGroup(0, sceneG); p.setBindGroup(1, cmpG); p.draw(4); p.end();
     let qi = -1;
     if (hasTS) { en.resolveQuerySet(qs, 0, 2, qR, 0); if (qFree.length) { qi = qFree.pop(); en.copyBufferToBuffer(qR, 0, qM[qi], 0, 16); } }
