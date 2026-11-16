@@ -1,14 +1,1 @@
-{
-  "name": "abyssal-garden",
-  "private": true,
-  "description": "A procedural underwater world rendered with WebGPU, bundled into one HTML file",
-  "type": "module",
-  "scripts": {
-    "build": "node build.mjs",
-    "build:readable": "node build.mjs --readable",
-    "build:dev": "node build.mjs --dev"
-  },
-  "devDependencies": {
-    "esbuild": "^0.28.2"
-  }
-}
+{"name":"forest","private":true,"type":"module","scripts":{"build":"node build.mjs"},"devDependencies":{"esbuild":"^0.28.0"}}

@@ -1,0 +1,10 @@
+import { createRequire } from 'module'; const { chromium } = createRequire(import.meta.url)('playwright');
+import fs from 'fs'; import http from 'http';
+const [query, js] = process.argv.slice(2);
+const srv = http.createServer((q, r) => { r.setHeader('content-type', 'text/html'); r.end(fs.readFileSync('/home/user/forest/index.html')); }).listen(0);
+const b = await chromium.launch({ args: ['--enable-unsafe-webgpu', '--enable-features=Vulkan', '--use-angle=swiftshader', '--use-webgpu-adapter=swiftshader', '--ignore-gpu-blocklist'] });
+const p = await b.newPage(); p.on('console', m => console.log('[page]', m.text().slice(0, 300)));
+await p.goto(`http://localhost:${srv.address().port}/?manual=1&w=160&h=90&${query}`);
+await p.waitForFunction('window.__ready', null, { timeout: 900000 });
+console.log(await p.evaluate(`(async()=>{${js}})()`));
+await b.close(); srv.close();
